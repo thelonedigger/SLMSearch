@@ -1,5 +1,7 @@
 Semantic Document Retrieval with RL Optimization
+
 Overview
+
 This project implements a semantic document retrieval system using MiniLM embeddings and optimizes it with reinforcement learning. It uses GPT-4o to evaluate retrieval quality against the MS MARCO dataset.
 
 Features:
