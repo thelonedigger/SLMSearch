@@ -89,9 +89,13 @@ def load_msmarco_data_chunked(data_dir, chunk, total_chunks):
     # Read only the specific chunk of passages
     collection_df = pd.DataFrame(columns=['pid', 'passage'])
     with open(collection_path, 'r', encoding='utf-8') as f:
-        for i, line in enumerate(f):
+        # Use tqdm to track progress through all lines but maintain original line counting logic
+        for i, line in tqdm(enumerate(f), total=end_line, desc="Loading passages"):
+            # Skip lines before our chunk starts
             if i < start_line:
                 continue
+            
+            # Stop when we reach the end of our chunk
             if i >= end_line:
                 break
             
@@ -100,6 +104,7 @@ def load_msmarco_data_chunked(data_dir, chunk, total_chunks):
                 pid, passage = parts
                 collection_df = pd.concat([collection_df, pd.DataFrame({'pid': [pid], 'passage': [passage]})], ignore_index=True)
             
+            # Keep the original progress reporting behavior for consistency
             if (i - start_line + 1) % 100000 == 0:
                 print(f"Loaded {i - start_line + 1} passages...")
     
