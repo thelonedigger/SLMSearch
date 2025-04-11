@@ -32,6 +32,8 @@ class MSMarcoDataset:
         train_qrels (pd.DataFrame): DataFrame containing training relevance judgments
         val_queries (pd.DataFrame): DataFrame containing validation queries
         val_qrels (pd.DataFrame): DataFrame containing validation relevance judgments
+        test_queries (pd.DataFrame): DataFrame containing test queries (if available)
+        test_qrels (pd.DataFrame): DataFrame containing test relevance judgments (if available)
         passage_id_to_idx (Dict[str, int]): Mapping from passage IDs to indices
         query_id_to_idx (Dict[str, int]): Mapping from query IDs to indices
     """
@@ -47,24 +49,40 @@ class MSMarcoDataset:
         
         # Load the preprocessed data
         self.collection, self.train_queries, self.train_qrels, \
-        self.val_queries, self.val_qrels = self._load_data()
+        self.val_queries, self.val_qrels, self.test_queries, self.test_qrels = self._load_data()
         
         # Create mappings for efficient lookups
         self.passage_id_to_idx = {pid: i for i, pid in enumerate(self.collection['pid'])}
         self.train_query_id_to_idx = {qid: i for i, qid in enumerate(self.train_queries['qid'])}
         self.val_query_id_to_idx = {qid: i for i, qid in enumerate(self.val_queries['qid'])}
         
+        # Create test query index mapping if test data exists
+        self.test_query_id_to_idx = {}
+        if self.test_queries is not None:
+            self.test_query_id_to_idx = {qid: i for i, qid in enumerate(self.test_queries['qid'])}
+        
         # Create set of positive passage IDs for each query
         self.train_query_positives = self._create_query_positives(self.train_qrels)
         self.val_query_positives = self._create_query_positives(self.val_qrels)
+        
+        # Create test query positives if test data exists
+        self.test_query_positives = {}
+        if self.test_qrels is not None:
+            self.test_query_positives = self._create_query_positives(self.test_qrels)
         
         print(f"Loaded {len(self.collection)} passages")
         print(f"Loaded {len(self.train_queries)} training queries")
         print(f"Loaded {len(self.val_queries)} validation queries")
         print(f"Loaded {len(self.train_qrels)} training relevance judgments")
         print(f"Loaded {len(self.val_qrels)} validation relevance judgments")
+        
+        # Print test data info if available
+        if self.test_queries is not None:
+            print(f"Loaded {len(self.test_queries)} test queries")
+        if self.test_qrels is not None:
+            print(f"Loaded {len(self.test_qrels)} test relevance judgments")
     
-    def _load_data(self) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    def _load_data(self) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, Optional[pd.DataFrame], Optional[pd.DataFrame]]:
         """
         Load preprocessed MS MARCO data from pickle files.
         
@@ -75,6 +93,8 @@ class MSMarcoDataset:
                 - train_qrels: DataFrame with training relevance judgments
                 - val_queries: DataFrame with validation queries
                 - val_qrels: DataFrame with validation relevance judgments
+                - test_queries: DataFrame with test queries (or None if not available)
+                - test_qrels: DataFrame with test relevance judgments (or None if not available)
         """
         try:
             collection = pd.read_pickle(os.path.join(self.data_dir, 'collection.pkl'))
@@ -83,7 +103,19 @@ class MSMarcoDataset:
             val_queries = pd.read_pickle(os.path.join(self.data_dir, 'val_queries.pkl'))
             val_qrels = pd.read_pickle(os.path.join(self.data_dir, 'val_qrels.pkl'))
             
-            return collection, train_queries, train_qrels, val_queries, val_qrels
+            # Try to load test data if available
+            test_queries = None
+            test_qrels = None
+            
+            test_queries_path = os.path.join(self.data_dir, 'test_queries.pkl')
+            test_qrels_path = os.path.join(self.data_dir, 'test_qrels.pkl')
+            
+            if os.path.exists(test_queries_path) and os.path.exists(test_qrels_path):
+                test_queries = pd.read_pickle(test_queries_path)
+                test_qrels = pd.read_pickle(test_qrels_path)
+                print("Custom test split found and loaded")
+            
+            return collection, train_queries, train_qrels, val_queries, val_qrels, test_queries, test_qrels
         
         except FileNotFoundError as e:
             raise FileNotFoundError(f"Could not load preprocessed data: {e}\n"
@@ -160,13 +192,32 @@ class MSMarcoDataset:
         else:
             raise KeyError(f"Query ID {qid} not found in validation queries")
     
+    def get_test_query_text(self, qid: str) -> str:
+        """
+        Get the text of a test query by its ID.
+        
+        Args:
+            qid (str): Query ID
+            
+        Returns:
+            str: Processed query text
+        """
+        if self.test_queries is None:
+            raise ValueError("Test queries not available. Make sure you're using a custom split dataset.")
+            
+        if qid in self.test_query_id_to_idx:
+            idx = self.test_query_id_to_idx[qid]
+            return self.test_queries.iloc[idx]['processed_query']
+        else:
+            raise KeyError(f"Query ID {qid} not found in test queries")
+    
     def get_relevant_passages(self, qid: str, split: str = 'train') -> Set[str]:
         """
         Get the set of relevant passage IDs for a query.
         
         Args:
             qid (str): Query ID
-            split (str): Data split ('train' or 'val')
+            split (str): Data split ('train', 'val', or 'test')
             
         Returns:
             Set[str]: Set of relevant passage IDs
@@ -181,8 +232,13 @@ class MSMarcoDataset:
                 return self.val_query_positives[qid]
             else:
                 return set()
+        elif split == 'test':
+            if self.test_query_positives and qid in self.test_query_positives:
+                return self.test_query_positives[qid]
+            else:
+                return set()
         else:
-            raise ValueError(f"Invalid split: {split}. Must be 'train' or 'val'")
+            raise ValueError(f"Invalid split: {split}. Must be 'train', 'val', or 'test'")
     
     def get_all_passages(self) -> List[Tuple[str, str]]:
         """
@@ -210,6 +266,27 @@ class MSMarcoDataset:
             List[Tuple[str, str]]: List of (query_id, processed_query) tuples
         """
         return list(zip(self.val_queries['qid'], self.val_queries['processed_query']))
+    
+    def get_test_queries(self) -> List[Tuple[str, str]]:
+        """
+        Get all test queries.
+        
+        Returns:
+            List[Tuple[str, str]]: List of (query_id, processed_query) tuples
+        """
+        if self.test_queries is None:
+            raise ValueError("Test queries not available. Make sure you're using a custom split dataset.")
+        
+        return list(zip(self.test_queries['qid'], self.test_queries['processed_query']))
+    
+    def has_test_split(self) -> bool:
+        """
+        Check if the dataset has a test split.
+        
+        Returns:
+            bool: True if test data is available, False otherwise
+        """
+        return self.test_queries is not None and self.test_qrels is not None
     
     def get_passage_batch_iterator(self, batch_size: int = 1000) -> 'BatchIterator':
         """
@@ -248,6 +325,22 @@ class MSMarcoDataset:
             BatchIterator: Iterator that yields batches of queries
         """
         queries = self.get_val_queries()
+        return BatchIterator(queries, batch_size)
+    
+    def get_test_query_batch_iterator(self, batch_size: int = 100) -> 'BatchIterator':
+        """
+        Get a batch iterator for test queries.
+        
+        Args:
+            batch_size (int): Size of each batch
+            
+        Returns:
+            BatchIterator: Iterator that yields batches of queries
+        """
+        if self.test_queries is None:
+            raise ValueError("Test queries not available. Make sure you're using a custom split dataset.")
+        
+        queries = self.get_test_queries()
         return BatchIterator(queries, batch_size)
 
 
@@ -338,6 +431,13 @@ if __name__ == "__main__":
     print(f"Number of validation queries: {len(dataset.val_queries)}")
     print(f"Number of training relevance judgments: {len(dataset.train_qrels)}")
     print(f"Number of validation relevance judgments: {len(dataset.val_qrels)}")
+    
+    # Print test statistics if available
+    if dataset.has_test_split():
+        print(f"Number of test queries: {len(dataset.test_queries)}")
+        print(f"Number of test relevance judgments: {len(dataset.test_qrels)}")
+    else:
+        print("No test split available (using standard MS MARCO splits)")
     
     # Example: Get first 5 passages
     print("\nFirst 5 passages:")

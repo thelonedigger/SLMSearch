@@ -15,7 +15,7 @@ DEFAULT_DATA_DIR = "./msmarco"  # Change this to your actual data directory path
 # Path to save processed files
 DEFAULT_OUTPUT_DIR = "./processed_data"
 # Whether to create custom splits instead of using standard MS MARCO splits
-DEFAULT_USE_CUSTOM_SPLITS = False
+DEFAULT_USE_CUSTOM_SPLITS = True
 # Ratio of data to use for validation (only for custom splits)
 DEFAULT_VAL_RATIO = 0.1
 # Ratio of data to use for testing (only for custom splits)
@@ -23,7 +23,7 @@ DEFAULT_TEST_RATIO = 0.1
 # Whether to create training examples with positive and negative passages
 DEFAULT_CREATE_EXAMPLES = True
 # Number of negative passages per positive example
-DEFAULT_N_NEGATIVES = 5
+DEFAULT_N_NEGATIVES = 25
 # Maximum number of queries to use for creating examples (None = use all)
 DEFAULT_MAX_EXAMPLES = None
 # Random seed

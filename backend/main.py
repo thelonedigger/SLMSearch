@@ -121,6 +121,24 @@ async def root():
         "redoc": "/redoc"
     }
 
+@app.get("/dataset-info")
+async def dataset_info(pipeline=Depends(get_pipeline)):
+    """
+    Get information about the dataset, including available splits
+    """
+    available_splits = pipeline.get_available_splits()
+    has_test_split = 'test' in available_splits
+    
+    return {
+        "available_splits": available_splits,
+        "has_test_split": has_test_split,
+        "is_custom_split": has_test_split,  # If test split exists, it's a custom split
+        "collection_size": len(pipeline.dataset.collection),
+        "train_queries": len(pipeline.dataset.train_queries),
+        "val_queries": len(pipeline.dataset.val_queries),
+        "test_queries": len(pipeline.dataset.test_queries) if has_test_split else 0,
+    }
+
 @app.post("/search", response_model=SearchResponse)
 async def search(request: SearchRequest, pipeline=Depends(get_pipeline)):
     """
@@ -157,6 +175,14 @@ async def evaluate(request: EvaluationRequest, pipeline=Depends(get_pipeline)):
     Evaluate the retrieval pipeline on a dataset split
     """
     try:
+        # Check if the requested split is available
+        available_splits = pipeline.get_available_splits()
+        if request.split not in available_splits:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Split '{request.split}' not available. Available splits: {available_splits}"
+            )
+        
         # Run evaluation
         metrics = pipeline.evaluate(
             split=request.split,
@@ -166,6 +192,8 @@ async def evaluate(request: EvaluationRequest, pipeline=Depends(get_pipeline)):
         
         return EvaluationResponse(metrics=metrics)
     
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Evaluation failed: {str(e)}")
 

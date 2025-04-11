@@ -136,7 +136,7 @@ class RetrievalPipeline:
         Evaluate the retrieval pipeline on a dataset split.
         
         Args:
-            split (str): Dataset split ('train' or 'val')
+            split (str): Dataset split ('train', 'val', or 'test')
             top_k (int): Number of top results to evaluate
             num_samples (Optional[int]): Number of queries to sample for evaluation (None for all)
             
@@ -145,13 +145,18 @@ class RetrievalPipeline:
         """
         print(f"Evaluating on {split} split...")
         
-        # Get queries
+        # Get queries based on the split
         if split == 'train':
             query_tuples = self.dataset.get_train_queries()
         elif split == 'val':
             query_tuples = self.dataset.get_val_queries()
+        elif split == 'test':
+            # Check if test split is available
+            if not self.dataset.has_test_split():
+                raise ValueError("Test split not available. Make sure you're using a custom split dataset.")
+            query_tuples = self.dataset.get_test_queries()
         else:
-            raise ValueError(f"Invalid split: {split}. Must be 'train' or 'val'")
+            raise ValueError(f"Invalid split: {split}. Must be 'train', 'val', or 'test'")
         
         # Sample queries if needed
         if num_samples is not None and num_samples < len(query_tuples):
@@ -262,6 +267,18 @@ class RetrievalPipeline:
             print(f"Plot saved to {save_path}")
         else:
             plt.show()
+    
+    def get_available_splits(self) -> List[str]:
+        """
+        Get the list of available splits in the dataset.
+        
+        Returns:
+            List[str]: List of available splits ('train', 'val', 'test')
+        """
+        splits = ['train', 'val']
+        if self.dataset.has_test_split():
+            splits.append('test')
+        return splits
 
 
 def calculate_metrics(
@@ -277,7 +294,7 @@ def calculate_metrics(
         query_ids (List[str]): List of query IDs
         retrieval_results (List[List[Tuple[str, float, str]]]): Retrieval results for each query
         dataset (MSMarcoDataset): Dataset handler
-        split (str): Dataset split ('train' or 'val')
+        split (str): Dataset split ('train', 'val', or 'test')
         
     Returns:
         Dict[str, float]: Dictionary of evaluation metrics
@@ -369,7 +386,7 @@ def run_evaluation(pipeline: RetrievalPipeline, split: str = 'val', top_k: int =
     
     Args:
         pipeline (RetrievalPipeline): Retrieval pipeline
-        split (str): Dataset split ('train' or 'val')
+        split (str): Dataset split ('train', 'val', or 'test')
         top_k (int): Number of top results to evaluate
         num_samples (Optional[int]): Number of queries to sample for evaluation (None for all)
         plot (bool): Whether to plot the results
@@ -378,6 +395,11 @@ def run_evaluation(pipeline: RetrievalPipeline, split: str = 'val', top_k: int =
     Returns:
         Dict[str, float]: Dictionary of evaluation metrics
     """
+    # Check if the split is available
+    available_splits = pipeline.get_available_splits()
+    if split not in available_splits:
+        raise ValueError(f"Split '{split}' not available. Available splits: {available_splits}")
+        
     # Evaluate
     metrics = pipeline.evaluate(split=split, top_k=top_k, num_samples=num_samples)
     
@@ -407,7 +429,7 @@ if __name__ == "__main__":
                         help="Directory to load the pipeline from")
     parser.add_argument("--batch_size", type=int, default=32,
                         help="Batch size for processing")
-    parser.add_argument("--eval_split", type=str, default="val", choices=["train", "val"],
+    parser.add_argument("--eval_split", type=str, default="val", choices=["train", "val", "test"],
                         help="Dataset split to evaluate on")
     parser.add_argument("--eval_top_k", type=int, default=100,
                         help="Number of top results to evaluate")
@@ -441,6 +463,17 @@ if __name__ == "__main__":
             print(f"Saving pipeline to {args.save_dir}...")
             pipeline.save(args.save_dir)
     
+    # Check if the evaluation split is available
+    available_splits = pipeline.get_available_splits()
+    if args.eval_split not in available_splits:
+        print(f"WARNING: Requested split '{args.eval_split}' is not available. Available splits: {available_splits}")
+        if 'val' in available_splits:
+            args.eval_split = 'val'
+            print(f"Falling back to 'val' split instead.")
+        else:
+            args.eval_split = available_splits[0]
+            print(f"Falling back to '{args.eval_split}' split instead.")
+    
     # Evaluate
     if not args.query_mode:
         metrics = run_evaluation(
@@ -449,7 +482,7 @@ if __name__ == "__main__":
             top_k=args.eval_top_k, 
             num_samples=args.eval_samples,
             plot=True,
-            plot_path=os.path.join(args.save_dir, "evaluation.png") if args.save_dir else None
+            plot_path=os.path.join(args.save_dir, f"evaluation_{args.eval_split}.png") if args.save_dir else None
         )
     
     # Query mode
