@@ -3,3 +3,4 @@
 /MSMARCO2
 /processed_data
 *.env
+__pycache__
