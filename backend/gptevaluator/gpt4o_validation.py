@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 
 # Import prompts from separate file
-from evaluation_prompts import get_passage_relevance_prompt, get_passage_ranking_prompt
+from gptevaluator.evaluation_prompts import get_passage_relevance_prompt, get_passage_ranking_prompt
 
 # Initialize OpenAI client
 client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))

@@ -23,8 +23,8 @@ import matplotlib.pyplot as plt
 from collections import defaultdict
 
 # Import from other modules
-from data_handler import MSMarcoDataset, load_preprocessed_data
-from embedding_engine import EmbeddingEngine, create_embedding_engine
+from datapipeline.data_handler import MSMarcoDataset, load_preprocessed_data
+from datapipeline.embedding_engine import EmbeddingEngine, create_embedding_engine
 
 
 class RetrievalPipeline:
