@@ -29,7 +29,7 @@ DEFAULT_MAX_EXAMPLES = None
 # Random seed
 DEFAULT_SEED = 12
 # Which chunk to process (1-based index)
-DEFAULT_CHUNK = 1
+DEFAULT_CHUNK = 2
 # Total number of chunks to split processing into
 DEFAULT_TOTAL_CHUNKS = 20
 # Whether this is the final chunk that should merge all previous chunks

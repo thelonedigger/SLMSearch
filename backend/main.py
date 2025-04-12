@@ -11,10 +11,10 @@ from pydantic import BaseModel
 load_dotenv()
 
 # Import from existing modules
-from backend.datapipeline.data_handler import load_preprocessed_data
-from backend.datapipeline.embedding_engine import create_embedding_engine
-from backend.datapipeline.retrieval_pipeline import RetrievalPipeline, run_evaluation
-from backend.gptevaluator.gpt4o_validation import validate_gpt4o_evaluation, validate_ranking_capability
+from datapipeline.data_handler import load_preprocessed_data
+from datapipeline.embedding_engine import create_embedding_engine
+from datapipeline.retrieval_pipeline import RetrievalPipeline, run_evaluation
+from gptevaluator.gpt4o_validation import validate_gpt4o_evaluation, validate_ranking_capability
 
 # Create FastAPI app
 app = FastAPI(
