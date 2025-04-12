@@ -16,8 +16,10 @@ import os
 import time
 import pickle
 import argparse
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
-from typing import List, Tuple, Dict, Set, Optional, Union, Any
+from typing import List, Tuple, Dict, Set, Optional, Union, Any, Callable
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 from collections import defaultdict
@@ -38,19 +40,45 @@ class RetrievalPipeline:
         dataset (MSMarcoDataset): Dataset handler
         embedding_engine (EmbeddingEngine): Embedding engine
         index_built (bool): Whether the index has been built
+        status_callback: Async function to report status updates
+        cancellation_check: Function to check if an operation was cancelled
+        current_operation_id: ID of the current operation
     """
     
-    def __init__(self, dataset: MSMarcoDataset, embedding_engine: EmbeddingEngine):
+    def __init__(self, 
+                dataset: MSMarcoDataset, 
+                embedding_engine: EmbeddingEngine,
+                status_callback: Optional[Callable] = None,
+                cancellation_check: Optional[Callable] = None):
         """
         Initialize the retrieval pipeline.
         
         Args:
             dataset (MSMarcoDataset): Dataset handler
             embedding_engine (EmbeddingEngine): Embedding engine
+            status_callback: Optional async function for status updates
+            cancellation_check: Optional function to check for cancellation
         """
         self.dataset = dataset
         self.embedding_engine = embedding_engine
         self.index_built = False
+        self.status_callback = status_callback
+        self.cancellation_check = cancellation_check
+        self.current_operation_id = None
+        
+        # Thread pool for running async callbacks from sync contexts
+        self._thread_pool = ThreadPoolExecutor(max_workers=1)
+    
+    async def _update_status(self, status: str, progress: float, details: Optional[str] = None, est_time_remaining: Optional[int] = None):
+        """Helper to call status callback if it exists"""
+        if self.status_callback and self.current_operation_id:
+            await self.status_callback(status, progress, details, est_time_remaining)
+    
+    def _check_cancelled(self) -> bool:
+        """Helper to check if operation was cancelled"""
+        if self.cancellation_check:
+            return self.cancellation_check()
+        return False
     
     def build_index(self, batch_size: int = 32) -> None:
         """
@@ -66,9 +94,56 @@ class RetrievalPipeline:
         passage_ids = [pid for pid, _ in passage_tuples]
         passage_texts = [text for _, text in passage_tuples]
         
-        # Build the index
-        self.embedding_engine.build_index(passage_ids, passage_texts, batch_size=batch_size)
-        self.index_built = True
+        # Create a progress callback for the embedding engine
+        def progress_callback(progress: float, message: str) -> bool:
+            # Convert to async and run in thread pool
+            if self.status_callback:
+                future = asyncio.run_coroutine_threadsafe(
+                    self._update_status("in-progress", progress, message),
+                    asyncio.get_event_loop()
+                )
+                # Wait for the callback to complete
+                try:
+                    future.result(timeout=1)
+                except:
+                    pass  # Ignore timeouts or errors in status updates
+            
+            # Check for cancellation
+            return self._check_cancelled()
+        
+        try:
+            # Build the index with progress tracking
+            self.embedding_engine.build_index(
+                passage_ids, 
+                passage_texts, 
+                batch_size=batch_size,
+                progress_callback=progress_callback
+            )
+            self.index_built = True
+            
+            # Final status update if not cancelled
+            if not self._check_cancelled() and self.status_callback:
+                asyncio.run_coroutine_threadsafe(
+                    self._update_status("completed", 100, "Index built successfully"),
+                    asyncio.get_event_loop()
+                )
+        except InterruptedError:
+            # Handle cancellation
+            print("Index building was cancelled")
+            if self.status_callback:
+                asyncio.run_coroutine_threadsafe(
+                    self._update_status("canceled", 0, "Index building was cancelled"),
+                    asyncio.get_event_loop()
+                )
+        except Exception as e:
+            # Handle other errors
+            print(f"Error building index: {str(e)}")
+            if self.status_callback:
+                asyncio.run_coroutine_threadsafe(
+                    self._update_status("error", 0, f"Error building index: {str(e)}"),
+                    asyncio.get_event_loop()
+                )
+            raise
     
     def retrieve(self, query: str, top_k: int = 10) -> List[Tuple[str, float, str]]:
         """
@@ -84,11 +159,26 @@ class RetrievalPipeline:
         if not self.index_built:
             raise ValueError("Index not built. Please call build_index() first.")
         
+        # Update status if callback exists
+        if self.status_callback:
+            asyncio.run_coroutine_threadsafe(
+                self._update_status("in-progress", 20, f"Searching for: {query[:30]}{'...' if len(query) > 30 else ''}"),
+                asyncio.get_event_loop()
+            )
+        
         # Search the index
         results = self.embedding_engine.search(query, top_k=top_k)
         
         # Add passage text to results
         detailed_results = []
+        
+        # Update status if callback exists
+        if self.status_callback:
+            asyncio.run_coroutine_threadsafe(
+                self._update_status("in-progress", 50, f"Found {len(results)} results, retrieving texts"),
+                asyncio.get_event_loop()
+            )
+        
         for pid, score in results:
             try:
                 passage_text = self.dataset.get_passage_text(pid)
@@ -96,6 +186,13 @@ class RetrievalPipeline:
             except KeyError:
                 # Skip passages that are not found in the dataset
                 continue
+        
+        # Final status update
+        if self.status_callback:
+            asyncio.run_coroutine_threadsafe(
+                self._update_status("completed", 100, f"Retrieved {len(detailed_results)} results"),
+                asyncio.get_event_loop()
+            )
         
         return detailed_results
     
@@ -113,12 +210,36 @@ class RetrievalPipeline:
         if not self.index_built:
             raise ValueError("Index not built. Please call build_index() first.")
         
+        # Update status with initial progress
+        if self.status_callback:
+            asyncio.run_coroutine_threadsafe(
+                self._update_status("in-progress", 0, f"Starting batch retrieval for {len(queries)} queries"),
+                asyncio.get_event_loop()
+            )
+        
         # Search the index
         batch_results = self.embedding_engine.batch_search(queries, top_k=top_k)
         
         # Add passage text to results
         detailed_batch_results = []
-        for results in batch_results:
+        
+        for i, results in enumerate(batch_results):
+            # Check for cancellation
+            if self._check_cancelled():
+                raise InterruptedError("Batch retrieval was cancelled")
+            
+            # Update progress
+            if self.status_callback:
+                progress = (i / len(batch_results)) * 100
+                asyncio.run_coroutine_threadsafe(
+                    self._update_status(
+                        "in-progress", 
+                        progress, 
+                        f"Processing query {i+1}/{len(batch_results)}"
+                    ),
+                    asyncio.get_event_loop()
+                )
+            
             detailed_results = []
             for pid, score in results:
                 try:
@@ -128,6 +249,13 @@ class RetrievalPipeline:
                     # Skip passages that are not found in the dataset
                     continue
             detailed_batch_results.append(detailed_results)
+        
+        # Final status update
+        if self.status_callback:
+            asyncio.run_coroutine_threadsafe(
+                self._update_status("completed", 100, f"Batch retrieval completed for {len(queries)} queries"),
+                asyncio.get_event_loop()
+            )
         
         return detailed_batch_results
     
@@ -144,6 +272,18 @@ class RetrievalPipeline:
             Dict[str, float]: Dictionary of evaluation metrics
         """
         print(f"Evaluating on {split} split...")
+        
+        # Initial status update
+        if self.status_callback:
+            asyncio.run_coroutine_threadsafe(
+                self._update_status(
+                    "in-progress", 
+                    0, 
+                    f"Starting evaluation on {split} split with top {top_k} results" +
+                    (f" ({num_samples} samples)" if num_samples else "")
+                ),
+                asyncio.get_event_loop()
+            )
         
         # Get queries based on the split
         if split == 'train':
@@ -163,23 +303,106 @@ class RetrievalPipeline:
             import random
             query_tuples = random.sample(query_tuples, num_samples)
         
+        # Status update after query preparation
+        if self.status_callback:
+            asyncio.run_coroutine_threadsafe(
+                self._update_status(
+                    "in-progress", 
+                    5, 
+                    f"Prepared {len(query_tuples)} queries for evaluation"
+                ),
+                asyncio.get_event_loop()
+            )
+        
         # Prepare query data
         query_ids = [qid for qid, _ in query_tuples]
         query_texts = [text for _, text in query_tuples]
         
-        # Retrieve passages
+        # Retrieve passages with progress updates
+        all_results = []
         start_time = time.time()
-        all_results = self.batch_retrieve(query_texts, top_k=top_k)
-        end_time = time.time()
         
-        # Calculate metrics
-        metrics = calculate_metrics(query_ids, all_results, self.dataset, split)
-        
-        # Add timing information
-        metrics['retrieval_time'] = end_time - start_time
-        metrics['queries_per_second'] = len(query_ids) / (end_time - start_time)
-        
-        return metrics
+        try:
+            for i, query_text in enumerate(query_texts):
+                # Check for cancellation
+                if self._check_cancelled():
+                    raise InterruptedError("Evaluation was cancelled")
+                
+                # Update progress
+                if self.status_callback:
+                    progress = 5 + (i / len(query_texts)) * 70  # 5% to 75%
+                    elapsed = time.time() - start_time
+                    
+                    # Estimate remaining time
+                    if i > 0:
+                        avg_time_per_query = elapsed / i
+                        remaining_queries = len(query_texts) - i
+                        est_remaining = int(avg_time_per_query * remaining_queries)
+                    else:
+                        est_remaining = None
+                    
+                    asyncio.run_coroutine_threadsafe(
+                        self._update_status(
+                            "in-progress", 
+                            progress, 
+                            f"Evaluating query {i+1}/{len(query_texts)}", 
+                            est_remaining
+                        ),
+                        asyncio.get_event_loop()
+                    )
+                
+                # Retrieve for this query
+                results = self.embedding_engine.search(query_text, top_k=top_k)
+                all_results.append(results)
+            
+            # Status update before metric calculation
+            if self.status_callback:
+                asyncio.run_coroutine_threadsafe(
+                    self._update_status(
+                        "in-progress", 
+                        80, 
+                        f"Retrieval completed, calculating metrics"
+                    ),
+                    asyncio.get_event_loop()
+                )
+            
+            # Calculate metrics
+            metrics = calculate_metrics(query_ids, all_results, self.dataset, split)
+            
+            # Add timing information
+            end_time = time.time()
+            metrics['retrieval_time'] = end_time - start_time
+            metrics['queries_per_second'] = len(query_ids) / (end_time - start_time)
+            
+            # Final status update
+            if self.status_callback:
+                asyncio.run_coroutine_threadsafe(
+                    self._update_status(
+                        "completed", 
+                        100, 
+                        f"Evaluation completed: MRR={metrics.get('mrr', 0):.4f}, nDCG={metrics.get('ndcg', 0):.4f}"
+                    ),
+                    asyncio.get_event_loop()
+                )
+            
+            return metrics
+            
+        except InterruptedError:
+            # Handle cancellation
+            if self.status_callback:
+                asyncio.run_coroutine_threadsafe(
+                    self._update_status("canceled", 0, "Evaluation was cancelled"),
+                    asyncio.get_event_loop()
+                )
+            raise
+        except Exception as e:
+            # Handle other errors
+            if self.status_callback:
+                asyncio.run_coroutine_threadsafe(
+                    self._update_status("error", 0, f"Error during evaluation: {str(e)}"),
+                    asyncio.get_event_loop()
+                )
+            raise
     
     def save(self, save_dir: str) -> None:
         """
@@ -190,19 +413,61 @@ class RetrievalPipeline:
         """
         os.makedirs(save_dir, exist_ok=True)
         
-        # Save the embedding engine
-        self.embedding_engine.save_index(save_dir)
+        # Create a progress callback for the embedding engine
+        def progress_callback(progress: float, message: str) -> bool:
+            # Convert to async and run in thread pool
+            if self.status_callback:
+                future = asyncio.run_coroutine_threadsafe(
+                    self._update_status("in-progress", progress, message),
+                    asyncio.get_event_loop()
+                )
+                # Wait for the callback to complete
+                try:
+                    future.result(timeout=1)
+                except:
+                    pass  # Ignore timeouts or errors in status updates
+            
+            # Check for cancellation
+            return self._check_cancelled()
         
-        # Save the pipeline state
-        state = {
-            'index_built': self.index_built
-        }
-        
-        state_path = os.path.join(save_dir, 'pipeline_state.pkl')
-        with open(state_path, 'wb') as f:
-            pickle.dump(state, f)
-        
-        print(f"Retrieval pipeline saved to {save_dir}")
+        try:
+            # Save the embedding engine with progress tracking
+            self.embedding_engine.save_index(save_dir, progress_callback=progress_callback)
+            
+            # Save the pipeline state
+            state = {
+                'index_built': self.index_built
+            }
+            
+            state_path = os.path.join(save_dir, 'pipeline_state.pkl')
+            with open(state_path, 'wb') as f:
+                pickle.dump(state, f)
+            
+            print(f"Retrieval pipeline saved to {save_dir}")
+            
+            # Final status update if not cancelled
+            if not self._check_cancelled() and self.status_callback:
+                asyncio.run_coroutine_threadsafe(
+                    self._update_status("completed", 100, f"Pipeline saved to {save_dir}"),
+                    asyncio.get_event_loop()
+                )
+        except InterruptedError:
+            # Handle cancellation
+            print("Saving was cancelled")
+            if self.status_callback:
+                asyncio.run_coroutine_threadsafe(
+                    self._update_status("canceled", 0, "Saving was cancelled"),
+                    asyncio.get_event_loop()
+                )
+        except Exception as e:
+            # Handle other errors
+            print(f"Error saving pipeline: {str(e)}")
+            if self.status_callback:
+                asyncio.run_coroutine_threadsafe(
+                    self._update_status("error", 0, f"Error saving pipeline: {str(e)}"),
+                    asyncio.get_event_loop()
+                )
+            raise
     
     def load(self, load_dir: str, use_gpu_index: bool = False) -> None:
         """
@@ -212,17 +477,64 @@ class RetrievalPipeline:
             load_dir (str): Directory containing the saved pipeline
             use_gpu_index (bool): Whether to use GPU for the FAISS index
         """
-        # Load the embedding engine
-        self.embedding_engine.load_index(load_dir, use_gpu_index=use_gpu_index)
+        # Create a progress callback for the embedding engine
+        def progress_callback(progress: float, message: str) -> bool:
+            # Convert to async and run in thread pool
+            if self.status_callback:
+                future = asyncio.run_coroutine_threadsafe(
+                    self._update_status("in-progress", progress, message),
+                    asyncio.get_event_loop()
+                )
+                # Wait for the callback to complete
+                try:
+                    future.result(timeout=1)
+                except:
+                    pass  # Ignore timeouts or errors in status updates
+            
+            # Check for cancellation
+            return self._check_cancelled()
         
-        # Load the pipeline state
-        state_path = os.path.join(load_dir, 'pipeline_state.pkl')
-        with open(state_path, 'rb') as f:
-            state = pickle.load(f)
-        
-        self.index_built = state['index_built']
-        
-        print(f"Retrieval pipeline loaded from {load_dir}")
+        try:
+            # Load the embedding engine with progress tracking
+            self.embedding_engine.load_index(
+                load_dir, 
+                use_gpu_index=use_gpu_index,
+                progress_callback=progress_callback
+            )
+            
+            # Load the pipeline state
+            state_path = os.path.join(load_dir, 'pipeline_state.pkl')
+            with open(state_path, 'rb') as f:
+                state = pickle.load(f)
+            
+            self.index_built = state['index_built']
+            
+            print(f"Retrieval pipeline loaded from {load_dir}")
+            
+            # Final status update if not cancelled
+            if not self._check_cancelled() and self.status_callback:
+                asyncio.run_coroutine_threadsafe(
+                    self._update_status("completed", 100, f"Pipeline loaded from {load_dir}"),
+                    asyncio.get_event_loop()
+                )
+        except InterruptedError:
+            # Handle cancellation
+            print("Loading was cancelled")
+            if self.status_callback:
+                asyncio.run_coroutine_threadsafe(
+                    self._update_status("canceled", 0, "Loading was cancelled"),
+                    asyncio.get_event_loop()
+                )
+            raise
+        except Exception as e:
+            # Handle other errors
+            print(f"Error loading pipeline: {str(e)}")
+            if self.status_callback:
+                asyncio.run_coroutine_threadsafe(
+                    self._update_status("error", 0, f"Error loading pipeline: {str(e)}"),
+                    asyncio.get_event_loop()
+                )
+            raise
     
     def plot_evaluation_results(self, metrics: Dict[str, float], save_path: Optional[str] = None) -> None:
         """
@@ -283,7 +595,7 @@ class RetrievalPipeline:
 
 def calculate_metrics(
     query_ids: List[str],
-    retrieval_results: List[List[Tuple[str, float, str]]],
+    retrieval_results: List[List[Tuple[str, float]]],
     dataset: MSMarcoDataset,
     split: str = 'val'
 ) -> Dict[str, float]:
@@ -292,7 +604,7 @@ def calculate_metrics(
     
     Args:
         query_ids (List[str]): List of query IDs
-        retrieval_results (List[List[Tuple[str, float, str]]]): Retrieval results for each query
+        retrieval_results (List[List[Tuple[str, float]]]): Retrieval results for each query
         dataset (MSMarcoDataset): Dataset handler
         split (str): Dataset split ('train', 'val', or 'test')
         
@@ -312,7 +624,7 @@ def calculate_metrics(
             continue
         
         # Extract retrieved passage IDs
-        retrieved_pids = [pid for pid, _, _ in results]
+        retrieved_pids = [pid for pid, _ in results]
         
         # Calculate reciprocal rank (for MRR)
         reciprocal_rank = 0.0

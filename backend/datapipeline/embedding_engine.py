@@ -17,9 +17,10 @@ import numpy as np
 import torch
 import faiss
 import pickle
-from typing import List, Tuple, Dict, Optional, Union, Any
+from typing import List, Tuple, Dict, Optional, Union, Any, Callable
 from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
+import time
 
 
 class EmbeddingEngine:
@@ -62,6 +63,10 @@ class EmbeddingEngine:
         self.index = None
         self.passage_ids = []
         self.index_initialized = False
+        
+        # Progress tracking
+        self.progress_callback = None
+        self.cancellation_check = None
     
     def encode_query(self, query: str) -> np.ndarray:
         """
@@ -97,25 +102,57 @@ class EmbeddingEngine:
             )
         return embeddings
     
-    def encode_passages(self, passages: List[str], batch_size: int = 32) -> np.ndarray:
+    def encode_passages(self, 
+                        passages: List[str], 
+                        batch_size: int = 32, 
+                        callback: Optional[Callable[[int, int], bool]] = None) -> np.ndarray:
         """
         Encode a list of passages into embedding vectors.
         
         Args:
             passages (List[str]): List of passage texts
             batch_size (int): Batch size for encoding
+            callback: Optional callback(current, total) -> should_cancel
             
         Returns:
             np.ndarray: Array of passage embedding vectors
         """
-        with torch.no_grad():
-            embeddings = self.model.encode(
-                passages, 
-                batch_size=batch_size, 
-                convert_to_numpy=True, 
-                show_progress_bar=True
-            )
-        return embeddings
+        # Check if we should use a custom progress tracking
+        if callback:
+            # Use our own batching logic to provide progress updates
+            total_batches = (len(passages) + batch_size - 1) // batch_size
+            all_embeddings = []
+            
+            for batch_idx in range(0, total_batches):
+                # Check for cancellation
+                if callback(batch_idx, total_batches):
+                    raise InterruptedError("Encoding cancelled by user")
+                
+                start_idx = batch_idx * batch_size
+                end_idx = min((batch_idx + 1) * batch_size, len(passages))
+                batch = passages[start_idx:end_idx]
+                
+                with torch.no_grad():
+                    batch_embeddings = self.model.encode(
+                        batch, 
+                        batch_size=batch_size, 
+                        convert_to_numpy=True,
+                        show_progress_bar=False
+                    )
+                all_embeddings.append(batch_embeddings)
+            
+            # Combine batches
+            return np.vstack(all_embeddings)
+        else:
+            # Use the built-in encoding
+            with torch.no_grad():
+                embeddings = self.model.encode(
+                    passages, 
+                    batch_size=batch_size, 
+                    convert_to_numpy=True, 
+                    show_progress_bar=True
+                )
+            return embeddings
     
     def initialize_index(self, use_gpu_index: bool = False) -> None:
         """
@@ -135,7 +172,11 @@ class EmbeddingEngine:
         
         self.index_initialized = True
     
-    def build_index(self, passage_ids: List[str], passages: List[str], batch_size: int = 32) -> None:
+    def build_index(self, 
+                    passage_ids: List[str], 
+                    passages: List[str], 
+                    batch_size: int = 32,
+                    progress_callback: Optional[Callable[[float, str], bool]] = None) -> None:
         """
         Build the FAISS index from passages.
         
@@ -143,11 +184,13 @@ class EmbeddingEngine:
             passage_ids (List[str]): List of passage IDs
             passages (List[str]): List of passage texts
             batch_size (int): Batch size for encoding
+            progress_callback: Optional callback(progress_percent, message) -> should_cancel
         """
         if not self.index_initialized:
             self.initialize_index()
         
         print(f"Building index with {len(passages)} passages")
+        start_time = time.time()
         
         # Store passage IDs for lookup
         self.passage_ids = passage_ids
@@ -155,19 +198,48 @@ class EmbeddingEngine:
         # Process in batches to avoid memory issues
         total_batches = (len(passages) + batch_size - 1) // batch_size
         
-        for i in tqdm(range(0, len(passages), batch_size), total=total_batches):
-            batch_passages = passages[i:i + batch_size]
-            
-            # Generate embeddings for this batch
-            batch_embeddings = self.encode_passages(batch_passages, batch_size=batch_size)
-            
-            # Normalize embeddings for cosine similarity
-            faiss.normalize_L2(batch_embeddings)
-            
-            # Add to index
-            self.index.add(batch_embeddings)
+        # Create a batch tracking callback if we have a progress callback
+        if progress_callback:
+            def batch_callback(current_batch, total_batches):
+                progress = (current_batch / total_batches) * 100
+                elapsed = time.time() - start_time
+                
+                # Estimate remaining time
+                if current_batch > 0:
+                    avg_time_per_batch = elapsed / current_batch
+                    remaining_batches = total_batches - current_batch
+                    estimated_remaining = avg_time_per_batch * remaining_batches
+                    time_message = f"Est. remaining: {int(estimated_remaining // 60)}m {int(estimated_remaining % 60)}s"
+                else:
+                    time_message = "Estimating time..."
+                
+                message = f"Processed {current_batch}/{total_batches} batches. {time_message}"
+                return progress_callback(progress, message)
+        else:
+            batch_callback = None
         
-        print(f"Index built with {self.index.ntotal} vectors")
+        # Generate embeddings with progress tracking
+        embeddings = self.encode_passages(
+            passages, 
+            batch_size=batch_size,
+            callback=batch_callback
+        )
+        
+        # Normalize embeddings for cosine similarity
+        faiss.normalize_L2(embeddings)
+        
+        # Add to index
+        self.index.add(embeddings)
+        
+        # Final progress update
+        if progress_callback:
+            elapsed = time.time() - start_time
+            minutes = int(elapsed // 60)
+            seconds = int(elapsed % 60)
+            message = f"Index built with {self.index.ntotal} vectors in {minutes}m {seconds}s"
+            progress_callback(100, message)
+        
+        print(f"Index built with {self.index.ntotal} vectors in {time.time() - start_time:.2f}s")
     
     def search(self, query: str, top_k: int = 10) -> List[Tuple[str, float]]:
         """
@@ -231,14 +303,20 @@ class EmbeddingEngine:
         
         return results
     
-    def save_index(self, save_dir: str) -> None:
+    def save_index(self, 
+                  save_dir: str, 
+                  progress_callback: Optional[Callable[[float, str], bool]] = None) -> None:
         """
         Save the FAISS index and passage IDs to disk.
         
         Args:
             save_dir (str): Directory to save the index
+            progress_callback: Optional callback(progress_percent, message) -> should_cancel
         """
         os.makedirs(save_dir, exist_ok=True)
+        
+        if progress_callback:
+            progress_callback(0, "Starting index save")
         
         # Save the index
         index_path = os.path.join(save_dir, 'faiss_index.bin')
@@ -246,39 +324,74 @@ class EmbeddingEngine:
         # If the index is on GPU, move it to CPU first
         index_to_save = faiss.index_gpu_to_cpu(self.index) if hasattr(self.index, 'getDevice') else self.index
         
+        if progress_callback:
+            progress_callback(30, "Saving FAISS index")
+        
         faiss.write_index(index_to_save, index_path)
         print(f"Index saved to {index_path}")
+        
+        if progress_callback:
+            progress_callback(70, "Saving passage IDs")
         
         # Save passage IDs
         passage_ids_path = os.path.join(save_dir, 'passage_ids.pkl')
         with open(passage_ids_path, 'wb') as f:
             pickle.dump(self.passage_ids, f)
+        
+        if progress_callback:
+            progress_callback(100, "Index save completed")
+        
         print(f"Passage IDs saved to {passage_ids_path}")
     
-    def load_index(self, load_dir: str, use_gpu_index: bool = False) -> None:
+    def load_index(self, 
+                  load_dir: str, 
+                  use_gpu_index: bool = False,
+                  progress_callback: Optional[Callable[[float, str], bool]] = None) -> None:
         """
         Load the FAISS index and passage IDs from disk.
         
         Args:
             load_dir (str): Directory containing the saved index
             use_gpu_index (bool): Whether to use GPU for the FAISS index
+            progress_callback: Optional callback(progress_percent, message) -> should_cancel
         """
+        if progress_callback:
+            progress_callback(0, "Starting index load")
+        
         # Load passage IDs
         passage_ids_path = os.path.join(load_dir, 'passage_ids.pkl')
         with open(passage_ids_path, 'rb') as f:
             self.passage_ids = pickle.load(f)
+        
+        if progress_callback:
+            progress_callback(30, f"Loaded {len(self.passage_ids)} passage IDs")
+        
         print(f"Loaded {len(self.passage_ids)} passage IDs from {passage_ids_path}")
         
         # Load the index
         index_path = os.path.join(load_dir, 'faiss_index.bin')
+        
+        if progress_callback:
+            progress_callback(40, "Loading FAISS index")
+        
         self.index = faiss.read_index(index_path)
+        
+        if progress_callback:
+            progress_callback(80, f"Loaded index with {self.index.ntotal} vectors")
+        
         print(f"Loaded index with {self.index.ntotal} vectors from {index_path}")
         
         # Move to GPU if requested and available
         if use_gpu_index and torch.cuda.is_available():
+            if progress_callback:
+                progress_callback(90, "Moving index to GPU")
+            
             print("Moving index to GPU")
             res = faiss.StandardGpuResources()
             self.index = faiss.index_cpu_to_gpu(res, 0, self.index)
+        
+        if progress_callback:
+            progress_callback(100, "Index load completed")
         
         self.index_initialized = True
 

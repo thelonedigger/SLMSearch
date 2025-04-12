@@ -55,6 +55,24 @@ export interface GPTEvaluationResponse {
   results_path: string;
 }
 
+// New interfaces for status endpoints
+export interface StatusResponse {
+  id: string;
+  status: string;
+  message: string;
+  timestamp: number;
+  progress?: number;
+}
+
+export interface StatusListResponse {
+  operations: StatusResponse[];
+}
+
+export interface CancelOperationResponse {
+  success: boolean;
+  message: string;
+}
+
 // API functions
 
 // Get dataset information
@@ -138,6 +156,43 @@ export async function runGPTRankingEvaluation(
   
   if (!response.ok) {
     throw new Error(`GPT ranking evaluation failed: ${response.statusText}`);
+  }
+  
+  return await response.json();
+}
+
+// New API functions for status and cancellation
+
+// Get status of all operations
+export async function getOperationStatuses(): Promise<StatusListResponse> {
+  const response = await fetch(`${API_BASE_URL}/operations/status`);
+  
+  if (!response.ok) {
+    throw new Error(`Failed to get operation statuses: ${response.statusText}`);
+  }
+  
+  return await response.json();
+}
+
+// Get status of a specific operation
+export async function getOperationStatus(operationId: string): Promise<StatusResponse> {
+  const response = await fetch(`${API_BASE_URL}/operations/status/${operationId}`);
+  
+  if (!response.ok) {
+    throw new Error(`Failed to get operation status: ${response.statusText}`);
+  }
+  
+  return await response.json();
+}
+
+// Cancel an operation
+export async function cancelOperation(operationId: string): Promise<CancelOperationResponse> {
+  const response = await fetch(`${API_BASE_URL}/operations/cancel/${operationId}`, {
+    method: "POST",
+  });
+  
+  if (!response.ok) {
+    throw new Error(`Failed to cancel operation: ${response.statusText}`);
   }
   
   return await response.json();

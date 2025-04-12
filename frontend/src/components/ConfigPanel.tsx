@@ -1,5 +1,7 @@
 import React, { useState, useEffect } from 'react';
-import { getDatasetInfo, DatasetInfo } from '../api/api';
+import { getDatasetInfo, DatasetInfo, cancelOperation } from '../api/api';
+import ProgressIndicator from './ProgressIndicator';
+import statusService from '../api/StatusService';
 
 interface ConfigPanelProps {
   onConfigChange?: (config: ConfigOptions) => void;
@@ -24,6 +26,11 @@ const ConfigPanel: React.FC<ConfigPanelProps> = ({ onConfigChange }) => {
     dataDir: './processed_data'
   });
   
+  // New state for operations in progress
+  const [indexOperationId, setIndexOperationId] = useState<string | null>(null);
+  const [indexProgress, setIndexProgress] = useState<number>(0);
+  const [isIndexing, setIsIndexing] = useState<boolean>(false);
+  
   // Fetch dataset info on component mount
   useEffect(() => {
     const fetchDatasetInfo = async () => {
@@ -42,6 +49,47 @@ const ConfigPanel: React.FC<ConfigPanelProps> = ({ onConfigChange }) => {
     fetchDatasetInfo();
   }, []);
   
+  // Monitor status updates related to indexing
+  useEffect(() => {
+    interface StatusUpdate {
+      id: string;
+      operation: string;
+      status: string;
+      progress?: number;
+    }
+    
+    const handleStatusUpdate = (updates: StatusUpdate[]) => {
+      // Find indexing operations
+      const indexOperation = updates.find(
+        update => update.operation === 'build_index' && 
+        (update.status === 'in-progress' || update.status === 'pending')
+      );
+      
+      if (indexOperation) {
+        setIndexOperationId(indexOperation.id);
+        setIndexProgress(indexOperation.progress || 0);
+        setIsIndexing(true);
+      } else {
+        setIsIndexing(false);
+      }
+    };
+    
+    // Listen for updates
+    const updatesListener = statusService.options.onStatusUpdate;
+    statusService.options.onStatusUpdate = (update) => {
+      updatesListener?.(update);
+      handleStatusUpdate(statusService.getStatusUpdates());
+    };
+    
+    // Initial check
+    handleStatusUpdate(statusService.getStatusUpdates());
+    
+    return () => {
+      // Restore original listener
+      statusService.options.onStatusUpdate = updatesListener;
+    };
+  }, []);
+  
   // Handle config changes and propagate to parent component
   const handleConfigChange = (key: keyof ConfigOptions, value: string | boolean | number) => {
     const newConfig = { ...config, [key]: value };
@@ -49,6 +97,18 @@ const ConfigPanel: React.FC<ConfigPanelProps> = ({ onConfigChange }) => {
     
     if (onConfigChange) {
       onConfigChange(newConfig);
+    }
+  };
+  
+  // Handle cancellation of the indexing operation
+  const handleCancelIndexing = async () => {
+    if (indexOperationId) {
+      try {
+        await cancelOperation(indexOperationId);
+        setIsIndexing(false);
+      } catch (error) {
+        console.error("Failed to cancel indexing operation:", error);
+      }
     }
   };
   
@@ -64,6 +124,24 @@ const ConfigPanel: React.FC<ConfigPanelProps> = ({ onConfigChange }) => {
           <div className="alert alert-error">{error}</div>
         ) : (
           <>
+            {/* Show progress indicator for indexing */}
+            {isIndexing && (
+              <div className="indexing-status">
+                <h3>Building Search Index</h3>
+                <ProgressIndicator 
+                  progress={indexProgress} 
+                  label="Indexing in progress" 
+                  isIndeterminate={indexProgress === 0}
+                />
+                <button 
+                  className="btn btn-secondary btn-sm" 
+                  onClick={handleCancelIndexing}
+                >
+                  Cancel Indexing
+                </button>
+              </div>
+            )}
+            
             <div className="stats-highlight">
               <h2>Dataset Information</h2>
               <div className="stats-container">
