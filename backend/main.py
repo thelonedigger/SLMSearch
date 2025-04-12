@@ -4,11 +4,25 @@ import os
 from dotenv import load_dotenv
 import json
 import time
+import traceback
+import logging
 from typing import List, Dict, Optional, Any
 from pydantic import BaseModel
 
+# Set up logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("backend_debug.log")
+    ]
+)
+logger = logging.getLogger(__name__)
+
 # Load environment variables from .env file
 load_dotenv()
+logger.info("Environment variables loaded")
 
 # Import from existing modules
 from datapipeline.data_handler import load_preprocessed_data
@@ -31,9 +45,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+logger.info("CORS middleware configured")
 
 # Get default top_k from environment or use 10 as default
 DEFAULT_TOP_K = int(os.environ.get("DEFAULT_TOP_K", 10))
+logger.info(f"Default TOP_K set to {DEFAULT_TOP_K}")
 
 # Define request and response models
 class SearchRequest(BaseModel):
@@ -83,31 +99,93 @@ async def get_pipeline():
             use_gpu = os.environ.get("USE_GPU", "False").lower() == "true"
             save_dir = os.environ.get("SAVE_DIR", "./saved_pipeline")
             
+            logger.info(f"Initializing pipeline with config: data_dir={data_dir}, model_name={model_name}, use_gpu={use_gpu}, save_dir={save_dir}")
+            
             # Check if data_dir exists
             if not os.path.exists(data_dir):
+                logger.error(f"Data directory {data_dir} not found!")
                 raise HTTPException(status_code=500, detail=f"Data directory {data_dir} not found. Please run data preprocessing first.")
             
+            # Check if data_dir contains required files
+            required_files = ['collection.pkl', 'train_queries.pkl', 'train_qrels.pkl', 'val_queries.pkl', 'val_qrels.pkl']
+            missing_files = [file for file in required_files if not os.path.exists(os.path.join(data_dir, file))]
+            if missing_files:
+                logger.error(f"Missing required files in data directory: {missing_files}")
+                raise HTTPException(status_code=500, detail=f"Missing required files in data directory: {missing_files}")
+            
             # Load dataset
-            dataset = load_preprocessed_data(data_dir)
+            logger.info("Loading dataset...")
+            try:
+                dataset = load_preprocessed_data(data_dir)
+                logger.info(f"Dataset loaded successfully with {len(dataset.collection)} passages")
+            except Exception as e:
+                logger.error(f"Error loading dataset: {str(e)}")
+                logger.error(traceback.format_exc())
+                raise HTTPException(status_code=500, detail=f"Failed to load dataset: {str(e)}")
             
             # Create embedding engine
-            embedding_engine = create_embedding_engine(model_name=model_name, use_gpu=use_gpu)
+            logger.info(f"Creating embedding engine with model {model_name}...")
+            try:
+                embedding_engine = create_embedding_engine(model_name=model_name, use_gpu=use_gpu)
+                logger.info("Embedding engine created successfully")
+            except Exception as e:
+                logger.error(f"Error creating embedding engine: {str(e)}")
+                logger.error(traceback.format_exc())
+                raise HTTPException(status_code=500, detail=f"Failed to create embedding engine: {str(e)}")
             
             # Create retrieval pipeline
-            pipeline = RetrievalPipeline(dataset, embedding_engine)
+            logger.info("Creating retrieval pipeline...")
+            try:
+                pipeline = RetrievalPipeline(dataset, embedding_engine)
+                logger.info("Retrieval pipeline created successfully")
+            except Exception as e:
+                logger.error(f"Error creating retrieval pipeline: {str(e)}")
+                logger.error(traceback.format_exc())
+                raise HTTPException(status_code=500, detail=f"Failed to create retrieval pipeline: {str(e)}")
+            
+            # Create save_dir if it doesn't exist
+            if not os.path.exists(save_dir):
+                logger.info(f"Creating save directory: {save_dir}")
+                os.makedirs(save_dir, exist_ok=True)
             
             # Build or load index
             if os.path.exists(os.path.join(save_dir, "pipeline_state.pkl")):
-                pipeline.load(save_dir, use_gpu_index=use_gpu)
+                logger.info(f"Found existing pipeline state at {os.path.join(save_dir, 'pipeline_state.pkl')}")
+                try:
+                    pipeline.load(save_dir, use_gpu_index=use_gpu)
+                    logger.info("Pipeline loaded successfully")
+                except Exception as e:
+                    logger.error(f"Error loading pipeline: {str(e)}")
+                    logger.error(traceback.format_exc())
+                    # If loading fails, we'll build a new index
+                    logger.info("Failed to load pipeline, will build new index")
+                    try:
+                        pipeline.build_index(batch_size=32)
+                        pipeline.save(save_dir)
+                        logger.info("New index built and saved successfully")
+                    except Exception as build_error:
+                        logger.error(f"Error building index: {str(build_error)}")
+                        logger.error(traceback.format_exc())
+                        raise HTTPException(status_code=500, detail=f"Failed to build index: {str(build_error)}")
             else:
                 # Build index if not found
-                pipeline.build_index(batch_size=32)
-                
-                # Save the pipeline
-                os.makedirs(save_dir, exist_ok=True)
-                pipeline.save(save_dir)
+                logger.info("No existing pipeline state found, building new index...")
+                try:
+                    pipeline.build_index(batch_size=32)
+                    logger.info("Index built successfully")
+                    
+                    # Save the pipeline
+                    logger.info(f"Saving pipeline to {save_dir}...")
+                    pipeline.save(save_dir)
+                    logger.info("Pipeline saved successfully")
+                except Exception as e:
+                    logger.error(f"Error building or saving index: {str(e)}")
+                    logger.error(traceback.format_exc())
+                    raise HTTPException(status_code=500, detail=f"Failed to build or save index: {str(e)}")
         
         except Exception as e:
+            logger.error(f"Unhandled exception in pipeline initialization: {str(e)}")
+            logger.error(traceback.format_exc())
             raise HTTPException(status_code=500, detail=f"Failed to initialize pipeline: {str(e)}")
     
     return pipeline
@@ -115,6 +193,7 @@ async def get_pipeline():
 @app.get("/")
 async def root():
     """Root endpoint providing API information"""
+    logger.info("Root endpoint accessed")
     return {
         "message": "Welcome to the Semantic Document Retrieval API",
         "documentation": "/docs",
@@ -126,24 +205,33 @@ async def dataset_info(pipeline=Depends(get_pipeline)):
     """
     Get information about the dataset, including available splits
     """
-    available_splits = pipeline.get_available_splits()
-    has_test_split = 'test' in available_splits
-    
-    return {
-        "available_splits": available_splits,
-        "has_test_split": has_test_split,
-        "is_custom_split": has_test_split,  # If test split exists, it's a custom split
-        "collection_size": len(pipeline.dataset.collection),
-        "train_queries": len(pipeline.dataset.train_queries),
-        "val_queries": len(pipeline.dataset.val_queries),
-        "test_queries": len(pipeline.dataset.test_queries) if has_test_split else 0,
-    }
+    logger.info("Dataset info endpoint accessed")
+    try:
+        available_splits = pipeline.get_available_splits()
+        has_test_split = 'test' in available_splits
+        
+        info = {
+            "available_splits": available_splits,
+            "has_test_split": has_test_split,
+            "is_custom_split": has_test_split,  # If test split exists, it's a custom split
+            "collection_size": len(pipeline.dataset.collection),
+            "train_queries": len(pipeline.dataset.train_queries),
+            "val_queries": len(pipeline.dataset.val_queries),
+            "test_queries": len(pipeline.dataset.test_queries) if has_test_split else 0,
+        }
+        logger.info(f"Dataset info response: {info}")
+        return info
+    except Exception as e:
+        logger.error(f"Error in dataset-info endpoint: {str(e)}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Error getting dataset info: {str(e)}")
 
 @app.post("/search", response_model=SearchResponse)
 async def search(request: SearchRequest, pipeline=Depends(get_pipeline)):
     """
     Search for relevant passages given a query
     """
+    logger.info(f"Search endpoint accessed with query: {request.query}, top_k: {request.top_k}")
     try:
         # Record start time
         start_time = time.time()
@@ -164,9 +252,12 @@ async def search(request: SearchRequest, pipeline=Depends(get_pipeline)):
             for pid, score, text in results
         ]
         
+        logger.info(f"Search completed in {execution_time:.3f}s with {len(formatted_results)} results")
         return SearchResponse(results=formatted_results, execution_time=execution_time)
     
     except Exception as e:
+        logger.error(f"Error in search endpoint: {str(e)}")
+        logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
 
 @app.post("/evaluate", response_model=EvaluationResponse)
@@ -174,10 +265,12 @@ async def evaluate(request: EvaluationRequest, pipeline=Depends(get_pipeline)):
     """
     Evaluate the retrieval pipeline on a dataset split
     """
+    logger.info(f"Evaluate endpoint accessed with split: {request.split}, top_k: {request.top_k}, num_samples: {request.num_samples}")
     try:
         # Check if the requested split is available
         available_splits = pipeline.get_available_splits()
         if request.split not in available_splits:
+            logger.error(f"Split '{request.split}' not available. Available splits: {available_splits}")
             raise HTTPException(
                 status_code=400, 
                 detail=f"Split '{request.split}' not available. Available splits: {available_splits}"
@@ -190,11 +283,16 @@ async def evaluate(request: EvaluationRequest, pipeline=Depends(get_pipeline)):
             num_samples=request.num_samples
         )
         
+        logger.info(f"Evaluation completed with metrics: {metrics}")
         return EvaluationResponse(metrics=metrics)
     
     except ValueError as e:
+        logger.error(f"ValueError in evaluate endpoint: {str(e)}")
+        logger.error(traceback.format_exc())
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
+        logger.error(f"Error in evaluate endpoint: {str(e)}")
+        logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Evaluation failed: {str(e)}")
 
 @app.post("/gpt-evaluate", response_model=GPTEvaluationResponse)
@@ -202,9 +300,11 @@ async def gpt_evaluate(request: GPTEvaluationRequest, background_tasks: Backgrou
     """
     Run GPT-4o evaluation for single passage evaluation
     """
+    logger.info(f"GPT evaluation endpoint accessed with num_samples: {request.num_samples}")
     try:
         # Check if OpenAI API key is set
         if not os.environ.get("OPENAI_API_KEY"):
+            logger.error("OPENAI_API_KEY environment variable not set")
             raise HTTPException(status_code=400, detail="OPENAI_API_KEY environment variable not set.")
         
         # Run GPT-4o evaluation in background to not block the response
@@ -214,6 +314,7 @@ async def gpt_evaluate(request: GPTEvaluationRequest, background_tasks: Backgrou
             num_samples=request.num_samples
         )
         
+        logger.info(f"GPT evaluation started with {request.num_samples} samples")
         return GPTEvaluationResponse(
             success=True,
             message=f"GPT-4o evaluation started with {request.num_samples} samples. Results will be saved to gpt4o_validation_results.csv",
@@ -221,6 +322,8 @@ async def gpt_evaluate(request: GPTEvaluationRequest, background_tasks: Backgrou
         )
     
     except Exception as e:
+        logger.error(f"Error in gpt-evaluate endpoint: {str(e)}")
+        logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"GPT-4o evaluation failed: {str(e)}")
 
 @app.post("/gpt-ranking-evaluate", response_model=GPTEvaluationResponse)
@@ -233,9 +336,11 @@ async def gpt_ranking_evaluate(
     """
     Run GPT-4o evaluation for passage ranking
     """
+    logger.info(f"GPT ranking evaluation endpoint accessed with num_queries: {num_queries}, passages_per_query: {passages_per_query}")
     try:
         # Check if OpenAI API key is set
         if not os.environ.get("OPENAI_API_KEY"):
+            logger.error("OPENAI_API_KEY environment variable not set")
             raise HTTPException(status_code=400, detail="OPENAI_API_KEY environment variable not set.")
         
         # Run GPT-4o ranking evaluation in background
@@ -246,6 +351,7 @@ async def gpt_ranking_evaluate(
             passages_per_query=passages_per_query
         )
         
+        logger.info(f"GPT ranking evaluation started with {num_queries} queries and {passages_per_query} passages per query")
         return GPTEvaluationResponse(
             success=True,
             message=f"GPT-4o ranking evaluation started with {num_queries} queries and {passages_per_query} passages per query. Results will be saved to gpt4o_ranking_validation.csv",
@@ -253,6 +359,8 @@ async def gpt_ranking_evaluate(
         )
     
     except Exception as e:
+        logger.error(f"Error in gpt-ranking-evaluate endpoint: {str(e)}")
+        logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"GPT-4o ranking evaluation failed: {str(e)}")
 
 # Run with: uvicorn main:app --reload
@@ -263,4 +371,5 @@ if __name__ == "__main__":
     host = os.environ.get("HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", 8000))
     
+    logger.info(f"Starting server on {host}:{port}")
     uvicorn.run(app, host=host, port=port)

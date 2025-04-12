@@ -2,5 +2,7 @@
 /MSMARCO
 /MSMARCO2
 /processed_data
+/processed_data_backup
 *.env
+*.log
 __pycache__

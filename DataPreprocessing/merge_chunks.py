@@ -4,7 +4,7 @@ import pandas as pd
 # Directory containing the chunks and where merged files will be saved
 OUTPUT_DIR = "./processed_data"
 # Total number of chunks to look for
-TOTAL_CHUNKS = 20
+TOTAL_CHUNKS = 2
 
 
 def merge_processed_chunks(output_dir, total_chunks):
