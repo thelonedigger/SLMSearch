@@ -1,4 +1,4 @@
-// Status update handling and WebSocket communication
+// Status update handling and WebSocket communication with fallback mechanism
 
 export type StatusType = 'pending' | 'in-progress' | 'completed' | 'error' | 'canceled' | 'canceling';
 
@@ -30,25 +30,49 @@ class StatusService {
   private statusUpdates: StatusUpdate[] = [];
   public options: StatusServiceOptions = {};
 
+  // Added fallback polling mechanism from update 1
+  private usePollingFallback = false;
+  private pollingInterval: number | null = null;
+  private pollIntervalMs = 5000; // Poll every 5 seconds
+
+  // Property for periodic connection check (added in update 1)
+  private connectionCheckInterval: number | null = null;
+
   constructor(options: StatusServiceOptions = {}) {
     this.options = options;
   }
 
-  // Added in update 1: getWebSocketUrl method to generate the correct WebSocket URL.
+  // Updated getWebSocketUrl from update 1:
   private getWebSocketUrl(): string {
-    // For development, explicitly use the backend URL
-    if (process.env.NODE_ENV === 'development') {
-      return 'ws://localhost:8000/ws/status';
+    // Check if a specific backend URL is configured
+    const configuredBackendUrl = process.env.REACT_APP_BACKEND_URL;
+    if (configuredBackendUrl) {
+      // Replace http/https with ws/wss
+      return configuredBackendUrl.replace(/^http/, 'ws') + '/ws/status';
     }
     
-    // For production, derive from window location
+    // For development, try to detect the backend port
+    if (process.env.NODE_ENV === 'development') {
+      // If frontend is running on port 3000, assume backend is on 8000
+      if (window.location.port === '3000') {
+        return `ws://${window.location.hostname}:8000/ws/status`;
+      }
+      return `ws://${window.location.hostname}:${window.location.port}/ws/status`;
+    }
+    
+    // For production
     const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsHost = window.location.hostname;
-    const wsPort = '8000'; // Always use the backend port
-    return `${wsProtocol}//${wsHost}:${wsPort}/ws/status`;
+    const wsPort = window.location.port || '80';
+    return `${wsProtocol}//${window.location.hostname}:${wsPort}/ws/status`;
   }
 
   public connect(url?: string): void {
+    // Don't try to connect if we're using polling fallback
+    if (this.usePollingFallback) {
+      console.log('Using polling fallback instead of WebSocket');
+      return;
+    }
+    
     const wsUrl = url || this.getWebSocketUrl();
     
     // Modification: check if already connected to avoid duplicate connections (update 1)
@@ -67,7 +91,16 @@ class StatusService {
     try {
       this.socket = new WebSocket(wsUrl);
       
+      // Add a connection timeout (update 1)
+      const connectionTimeout = setTimeout(() => {
+        if (this.socket && this.socket.readyState !== WebSocket.OPEN) {
+          console.error('WebSocket connection timed out');
+          this.socket.close();
+        }
+      }, 5000); // 5 second timeout
+      
       this.socket.onopen = () => {
+        clearTimeout(connectionTimeout);
         console.log('WebSocket connected');
         this.isConnected = true;
         this.reconnectAttempts = 0;
@@ -93,10 +126,19 @@ class StatusService {
       };
 
       this.socket.onclose = (event) => {
+        clearTimeout(connectionTimeout);
         console.log(`WebSocket disconnected with code ${event.code}, reason: ${event.reason}`);
         this.isConnected = false;
         this.options.onConnectionChange?.(false);
         this.stopConnectionCheck();
+        
+        // If we've had too many failed attempts, switch to polling fallback (update 1)
+        if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+          console.warn('Max reconnect attempts reached. Switching to polling fallback.');
+          this.setupPolling();
+          return;
+        }
+        
         this.attemptReconnect(wsUrl);
       };
 
@@ -113,7 +155,60 @@ class StatusService {
     }
   }
 
-  // Added in update 1: Begin periodic connection check methods
+  // Set up polling as a fallback (added in update 1)
+  private setupPolling(): void {
+    if (this.pollingInterval) {
+      clearInterval(this.pollingInterval);
+    }
+    
+    console.log(`Setting up polling fallback mechanism (${this.pollIntervalMs}ms interval)`);
+    
+    this.usePollingFallback = true;
+    this.pollingInterval = window.setInterval(() => {
+      this.pollOperationStatus();
+    }, this.pollIntervalMs);
+    
+    // Immediately poll once
+    this.pollOperationStatus();
+  }
+  
+  // Poll for status updates (added in update 1)
+  private async pollOperationStatus(): Promise<void> {
+    try {
+      // Call the REST API endpoint to get operation status
+      const response = await fetch('/operations/status');
+      
+      if (response.ok) {
+        const data = await response.json();
+        
+        // Process each operation status
+        if (data && data.operations) {
+          for (const operation of data.operations) {
+            // Create a compatible status update
+            const statusUpdate: StatusUpdate = {
+              id: operation.id,
+              title: operation.title,
+              status: operation.status,
+              details: operation.details,
+              timestamp: operation.timestamp,
+              progress: operation.progress,
+              operation: operation.operation,
+              estimatedTimeRemaining: operation.estimated_time_remaining
+            };
+            
+            // Handle the status update
+            this.handleStatusUpdate(statusUpdate);
+          }
+        }
+      } else {
+        console.error('Failed to poll operation status:', response.statusText);
+      }
+    } catch (error) {
+      console.error('Error polling operation status:', error);
+    }
+  }
+
+  // Begin periodic connection check methods (added in update 1)
   private startConnectionCheck(): void {
     // Clear any existing interval
     this.stopConnectionCheck();
@@ -136,16 +231,14 @@ class StatusService {
       this.connectionCheckInterval = null;
     }
   }
-  // Added property for connection check interval
-  private connectionCheckInterval: number | null = null;
-
+  
   // Added in update 1: reconnect that calls disconnect and then connect.
   private reconnect(): void {
     this.disconnect();
     this.connect();
   }
 
-  // Modified in update 1: attemptReconnect now uses exponential backoff and logs updated messages.
+  // Modified in update 1: attemptReconnect now uses exponential backoff and switches to polling fallback after max attempts.
   private attemptReconnect(url: string): void {
     if (this.reconnectAttempts < this.maxReconnectAttempts) {
       this.reconnectAttempts++;
@@ -159,20 +252,21 @@ class StatusService {
         this.connect(url);
       }, cappedDelay);
     } else {
-      console.error('Max reconnect attempts reached. WebSocket connection failed.');
-      
-      // After max attempts, try one final reconnect after a longer delay
-      setTimeout(() => {
-        this.reconnectAttempts = 0; // Reset counter
-        this.connect(url);
-      }, 60000); // Try again after a minute
+      console.error('Max reconnect attempts reached. Switching to polling fallback.');
+      this.setupPolling();
+      return;
     }
   }
-  // End of update 1 modifications
 
   public disconnect(): void {
     // Stop connection check interval
     this.stopConnectionCheck();
+    
+    // Stop polling if active (update 1)
+    if (this.pollingInterval) {
+      clearInterval(this.pollingInterval);
+      this.pollingInterval = null;
+    }
     
     if (this.socket) {
       // Only close if not already closed (added in update 1)
@@ -229,6 +323,17 @@ class StatusService {
   }
 
   public cancelOperation(operationId: string): void {
+    // Added in update 1: When using polling fallback, use fetch API to cancel operation.
+    if (this.usePollingFallback) {
+      fetch(`/operations/cancel/${operationId}`, {
+        method: 'POST',
+      }).catch(error => {
+        console.error('Error sending cancel request:', error);
+        this.options.onError?.(error);
+      });
+      return;
+    }
+
     if (!this.isConnected || !this.socket) {
       console.error('Cannot cancel operation: WebSocket not connected');
       return;
@@ -253,8 +358,8 @@ class StatusService {
   }
 
   public checkStatus(): boolean {
-    // In update 1, check that the socket is both connected and open
-    return this.isConnected && this.socket?.readyState === WebSocket.OPEN;
+    // In update 1, check that the socket is connected and open or fallback is enabled
+    return (this.isConnected && this.socket?.readyState === WebSocket.OPEN) || this.usePollingFallback;
   }
 }
 
