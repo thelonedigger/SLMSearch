@@ -94,7 +94,7 @@ class EmbeddingEngine:
             try:
                 return future.result(timeout=5)
             except concurrent.futures.TimeoutError:
-                print("Progress callback timed out (non-critical)")
+#                print("Progress callback timed out (non-critical)")
                 return False
             except Exception as e:
                 print(f"Error in progress callback future: {str(e)}")
@@ -146,7 +146,7 @@ class EmbeddingEngine:
                         batch_size: int = 32, 
                         callback: Optional[Callable[[int, int], bool]] = None) -> np.ndarray:
         """
-        Encode a list of passages into embedding vectors.
+        Encode a list of passages into embedding vectors with tqdm progress bar.
         
         Args:
             passages (List[str]): List of passage texts
@@ -162,9 +162,18 @@ class EmbeddingEngine:
             total_batches = (len(passages) + batch_size - 1) // batch_size
             all_embeddings = []
             
-            for batch_idx in range(0, total_batches):
+            # Create a tqdm progress bar
+            progress_bar = tqdm(
+                total=total_batches,
+                desc="Encoding passages",
+                unit="batch",
+                ncols=100
+            )
+            
+            for batch_idx in range(total_batches):
                 # Check for cancellation
                 if callback(batch_idx, total_batches):
+                    progress_bar.close()
                     raise InterruptedError("Encoding cancelled by user")
                 
                 start_idx = batch_idx * batch_size
@@ -179,19 +188,43 @@ class EmbeddingEngine:
                         show_progress_bar=False
                     )
                 all_embeddings.append(batch_embeddings)
+                
+                # Update progress bar
+                progress_bar.update(1)
+                progress_bar.set_postfix({"passages": f"{end_idx}/{len(passages)}"})
+            
+            progress_bar.close()
             
             # Combine batches
             return np.vstack(all_embeddings)
         else:
-            # Use the built-in encoding
-            with torch.no_grad():
-                embeddings = self.model.encode(
-                    passages, 
-                    batch_size=batch_size, 
-                    convert_to_numpy=True, 
-                    show_progress_bar=True
-                )
-            return embeddings
+            # Use the built-in encoding with tqdm
+            print(f"Encoding {len(passages)} passages with batch size {batch_size}")
+            
+            # Create manual batching to use tqdm
+            total_batches = (len(passages) + batch_size - 1) // batch_size
+            all_embeddings = []
+            
+            with tqdm(total=total_batches, desc="Encoding passages", unit="batch", ncols=100) as progress_bar:
+                for batch_idx in range(total_batches):
+                    start_idx = batch_idx * batch_size
+                    end_idx = min((batch_idx + 1) * batch_size, len(passages))
+                    batch = passages[start_idx:end_idx]
+                    
+                    with torch.no_grad():
+                        batch_embeddings = self.model.encode(
+                            batch, 
+                            batch_size=batch_size, 
+                            convert_to_numpy=True,
+                            show_progress_bar=False
+                        )
+                    all_embeddings.append(batch_embeddings)
+                    
+                    # Update progress bar
+                    progress_bar.update(1)
+                    progress_bar.set_postfix({"passages": f"{end_idx}/{len(passages)}"})
+            
+            return np.vstack(all_embeddings)
     
     def initialize_index(self, use_gpu_index: bool = False) -> None:
         """
@@ -217,7 +250,7 @@ class EmbeddingEngine:
                     batch_size: int = 32,
                     progress_callback: Optional[Callable[[float, str], bool]] = None) -> None:
         """
-        Build the FAISS index from passages.
+        Build the FAISS index from passages with tqdm progress bar.
         
         Args:
             passage_ids (List[str]): List of passage IDs
@@ -227,6 +260,16 @@ class EmbeddingEngine:
         """
         if not self.index_initialized:
             self.initialize_index()
+        
+        # Create a tqdm progress bar for the overall process
+        main_progress = tqdm(
+            total=100,
+            desc="Building index",
+            unit="%",
+            ncols=100,
+            position=0,
+            leave=True
+        )
         
         print(f"Building index with {len(passages)} passages")
         start_time = time.time()
@@ -241,17 +284,21 @@ class EmbeddingEngine:
         if progress_callback:
             should_cancel = self._run_progress_callback(0, f"Starting index build for {len(passages)} passages", progress_callback)
             if should_cancel:
+                main_progress.close()
                 raise InterruptedError("Operation cancelled by user")
+        
+        main_progress.update(5)  # 5% progress for initialization
         
         # Create a batch tracking callback if we have a progress callback
         if progress_callback:
             def batch_callback(current_batch, total_batches):
-                progress = (current_batch / total_batches) * 100
+                progress = (current_batch / total_batches) * 70  # Encoding takes ~70% of the process
                 elapsed = time.time() - start_time
                 
                 # Ensure we log progress regularly
                 if current_batch % max(1, total_batches // 50) == 0 or current_batch == total_batches - 1:
-                    print(f"Indexing progress: {current_batch}/{total_batches} batches ({progress:.2f}%)")
+                    main_progress.update(max(0, int(progress - main_progress.n)))
+                    main_progress.set_postfix({"batch": f"{current_batch}/{total_batches}"})
                 
                 # Estimate remaining time
                 if current_batch > 0:
@@ -263,7 +310,7 @@ class EmbeddingEngine:
                     time_message = "Estimating time..."
                 
                 message = f"Processed {current_batch}/{total_batches} batches ({int(progress)}%). {time_message}"
-                should_cancel = self._run_progress_callback(progress, message, progress_callback)
+                should_cancel = self._run_progress_callback(5 + progress, message, progress_callback)
                 return should_cancel
         else:
             batch_callback = None
@@ -276,17 +323,25 @@ class EmbeddingEngine:
                 callback=batch_callback
             )
             
+            # Update main progress bar
+            main_progress.update(max(0, 75 - main_progress.n))  # Ensure we're at 75%
+            
             # Progress update before normalization
             if progress_callback:
-                should_cancel = self._run_progress_callback(90, "Normalizing embeddings and adding to index...", progress_callback)
+                should_cancel = self._run_progress_callback(75, "Normalizing embeddings and adding to index...", progress_callback)
                 if should_cancel:
+                    main_progress.close()
                     raise InterruptedError("Operation cancelled by user")
             
             # Normalize embeddings for cosine similarity
+            main_progress.set_postfix({"status": "Normalizing embeddings"})
             faiss.normalize_L2(embeddings)
+            main_progress.update(10)  # Now at 85%
             
             # Add to index
+            main_progress.set_postfix({"status": "Adding to index"})
             self.index.add(embeddings)
+            main_progress.update(10)  # Now at 95%
             
             # Final progress update
             if progress_callback:
@@ -296,17 +351,22 @@ class EmbeddingEngine:
                 message = f"Index built with {self.index.ntotal} vectors in {minutes}m {seconds}s"
                 should_cancel = self._run_progress_callback(100, message, progress_callback)
                 if should_cancel:
+                    main_progress.close()
                     raise InterruptedError("Operation cancelled by user")
+            
+            main_progress.update(max(0, 100 - main_progress.n))
+            main_progress.set_postfix({"status": "Complete"})
+            main_progress.close()
             
             print(f"Index built with {self.index.ntotal} vectors in {time.time() - start_time:.2f}s")
         
         except InterruptedError as e:
+            main_progress.close()
             print(f"Index building was interrupted: {str(e)}")
-            # Make sure to propagate the interruption
             raise
         except Exception as e:
+            main_progress.close()
             print(f"Error building index: {str(e)}")
-            # Also update progress callback with error if available
             if progress_callback:
                 self._run_progress_callback(0, f"Error building index: {str(e)}", progress_callback)
             raise
