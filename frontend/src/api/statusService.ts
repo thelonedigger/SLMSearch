@@ -34,18 +34,39 @@ class StatusService {
     this.options = options;
   }
 
-  public connect(url: string = `ws://${window.location.host}/ws/status`): void {
+  // Added in update 1: getWebSocketUrl method to generate the correct WebSocket URL.
+  private getWebSocketUrl(): string {
+    // For development, explicitly use the backend URL
+    if (process.env.NODE_ENV === 'development') {
+      return 'ws://localhost:8000/ws/status';
+    }
+    
+    // For production, derive from window location
+    const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsHost = window.location.hostname;
+    const wsPort = '8000'; // Always use the backend port
+    return `${wsProtocol}//${wsHost}:${wsPort}/ws/status`;
+  }
+
+  public connect(url?: string): void {
+    const wsUrl = url || this.getWebSocketUrl();
+    
     // Modification: check if already connected to avoid duplicate connections (update 1)
-    if (this.socket && this.isConnected) {
+    if (this.socket && this.isConnected && this.socket.readyState === WebSocket.OPEN) {
       console.log('WebSocket already connected');
       return;
     }
 
-    console.log(`Connecting to WebSocket at ${url}`);
+    // If we have an existing socket in a non-open state, clean it up
+    if (this.socket) {
+      this.disconnect();
+    }
+
+    console.log(`Connecting to WebSocket at ${wsUrl}`);
     
     try {
-      this.socket = new WebSocket(url);
-
+      this.socket = new WebSocket(wsUrl);
+      
       this.socket.onopen = () => {
         console.log('WebSocket connected');
         this.isConnected = true;
@@ -76,7 +97,7 @@ class StatusService {
         this.isConnected = false;
         this.options.onConnectionChange?.(false);
         this.stopConnectionCheck();
-        this.attemptReconnect(url);
+        this.attemptReconnect(wsUrl);
       };
 
       this.socket.onerror = (error) => {
@@ -88,7 +109,7 @@ class StatusService {
       this.options.onError?.(error);
       this.isConnected = false;
       this.options.onConnectionChange?.(false);
-      this.attemptReconnect(url);
+      this.attemptReconnect(wsUrl);
     }
   }
 
@@ -117,11 +138,13 @@ class StatusService {
   }
   // Added property for connection check interval
   private connectionCheckInterval: number | null = null;
+
   // Added in update 1: reconnect that calls disconnect and then connect.
   private reconnect(): void {
     this.disconnect();
     this.connect();
   }
+
   // Modified in update 1: attemptReconnect now uses exponential backoff and logs updated messages.
   private attemptReconnect(url: string): void {
     if (this.reconnectAttempts < this.maxReconnectAttempts) {
@@ -137,6 +160,12 @@ class StatusService {
       }, cappedDelay);
     } else {
       console.error('Max reconnect attempts reached. WebSocket connection failed.');
+      
+      // After max attempts, try one final reconnect after a longer delay
+      setTimeout(() => {
+        this.reconnectAttempts = 0; // Reset counter
+        this.connect(url);
+      }, 60000); // Try again after a minute
     }
   }
   // End of update 1 modifications

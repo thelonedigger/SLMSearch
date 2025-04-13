@@ -74,6 +74,19 @@ class RetrievalPipeline:
         if self.status_callback and self.current_operation_id:
             await self.status_callback(status, progress, details, est_time_remaining)
     
+    # 1. Add this helper function to the class
+    def _create_status_update_coro(self, status, progress, details=None, est_time_remaining=None):
+        """Create a coroutine for status updates without executing it"""
+        async def status_update_coro():
+            try:
+                if self.status_callback and self.current_operation_id:
+                    await self.status_callback(status, progress, details, est_time_remaining)
+            except Exception as e:
+                print(f"Error in status update coroutine: {str(e)}")
+                import traceback
+                print(traceback.format_exc())
+        return status_update_coro()
+    
     def _check_cancelled(self) -> bool:
         """Helper to check if operation was cancelled"""
         if self.cancellation_check:
@@ -102,24 +115,42 @@ class RetrievalPipeline:
                 asyncio.get_event_loop()
             )
         
-        # Create a progress callback for the embedding engine
+        # 2. Replace the progress_callback implementation in build_index with:
         def progress_callback(progress: float, message: str) -> bool:
+            """Progress callback for the embedding engine"""
             # Log progress to console
             if progress % 5 == 0 or progress == 100:
                 print(f"Index build progress: {progress:.1f}% - {message}")
                 
             # Convert to async and run in thread pool
             if self.status_callback:
-                future = asyncio.run_coroutine_threadsafe(
-                    self._update_status("in-progress", progress, message),
-                    asyncio.get_event_loop()
-                )
-                # Wait for the callback to complete
                 try:
-                    future.result(timeout=1)
+                    # Create a coroutine object without executing it
+                    coro = self._create_status_update_coro("in-progress", progress, message)
+                    
+                    # Run the coroutine in the event loop
+                    future = asyncio.run_coroutine_threadsafe(
+                        coro,
+                        asyncio.get_event_loop()
+                    )
+                    
+                    # Wait for the callback to complete with better error handling
+                    try:
+                        # Increased timeout to handle slower operations
+                        future.result(timeout=5)
+                    except Exception as e:
+                        import concurrent.futures
+                        if isinstance(e, concurrent.futures.TimeoutError):
+                            print("Status update timed out (non-critical)")
+                        else:
+                            print(f"Error in status callback future: {str(e)}")
+                            import traceback
+                            print(traceback.format_exc())
                 except Exception as e:
-                    print(f"Error in status callback: {str(e)}")
-                
+                    print(f"Error setting up status callback: {str(e)}")
+                    import traceback
+                    print(traceback.format_exc())
+                    
             # Check for cancellation
             return self._check_cancelled()
         
@@ -425,20 +456,26 @@ class RetrievalPipeline:
         """
         os.makedirs(save_dir, exist_ok=True)
         
+        # 3. Make similar changes to other methods that use asyncio.run_coroutine_threadsafe:
         # Create a progress callback for the embedding engine
         def progress_callback(progress: float, message: str) -> bool:
             # Convert to async and run in thread pool
             if self.status_callback:
-                future = asyncio.run_coroutine_threadsafe(
-                    self._update_status("in-progress", progress, message),
-                    asyncio.get_event_loop()
-                )
-                # Wait for the callback to complete
                 try:
-                    future.result(timeout=1)
-                except:
-                    pass  # Ignore timeouts or errors in status updates
-            
+                    coro = self._create_status_update_coro("in-progress", progress, message)
+                    future = asyncio.run_coroutine_threadsafe(
+                        coro,
+                        asyncio.get_event_loop()
+                    )
+                    future.result(timeout=5)
+                except Exception as e:
+                    import concurrent.futures
+                    if isinstance(e, concurrent.futures.TimeoutError):
+                        print("Status update timed out (non-critical)")
+                    else:
+                        print(f"Error in status callback future: {str(e)}")
+                        import traceback
+                        print(traceback.format_exc())
             # Check for cancellation
             return self._check_cancelled()
         
@@ -489,20 +526,26 @@ class RetrievalPipeline:
             load_dir (str): Directory containing the saved pipeline
             use_gpu_index (bool): Whether to use GPU for the FAISS index
         """
+        # 3. Make similar changes to other methods that use asyncio.run_coroutine_threadsafe:
         # Create a progress callback for the embedding engine
         def progress_callback(progress: float, message: str) -> bool:
             # Convert to async and run in thread pool
             if self.status_callback:
-                future = asyncio.run_coroutine_threadsafe(
-                    self._update_status("in-progress", progress, message),
-                    asyncio.get_event_loop()
-                )
-                # Wait for the callback to complete
                 try:
-                    future.result(timeout=1)
-                except:
-                    pass  # Ignore timeouts or errors in status updates
-            
+                    coro = self._create_status_update_coro("in-progress", progress, message)
+                    future = asyncio.run_coroutine_threadsafe(
+                        coro,
+                        asyncio.get_event_loop()
+                    )
+                    future.result(timeout=5)
+                except Exception as e:
+                    import concurrent.futures
+                    if isinstance(e, concurrent.futures.TimeoutError):
+                        print("Status update timed out (non-critical)")
+                    else:
+                        print(f"Error in status callback future: {str(e)}")
+                        import traceback
+                        print(traceback.format_exc())
             # Check for cancellation
             return self._check_cancelled()
         

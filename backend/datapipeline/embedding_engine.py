@@ -21,7 +21,8 @@ from typing import List, Tuple, Dict, Optional, Union, Any, Callable
 from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 import time
-
+import asyncio
+import concurrent.futures
 
 class EmbeddingEngine:
     """
@@ -67,7 +68,45 @@ class EmbeddingEngine:
         # Progress tracking
         self.progress_callback = None
         self.cancellation_check = None
-    
+
+    # Add a helper function to safely run a coroutine from a non-async context
+    def _run_progress_callback(self, progress, message, callback):
+        """Safely run an async progress callback from a non-async context"""
+        if not callback:
+            return False
+        
+        try:
+            # Create a coroutine for the callback
+            async def callback_coro():
+                try:
+                    return await callback(progress, message)
+                except Exception as e:
+                    print(f"Error in progress callback coroutine: {str(e)}")
+                    import traceback
+                    print(traceback.format_exc())
+                    return False
+                    
+            # Run in the event loop
+            loop = asyncio.get_event_loop()
+            future = asyncio.run_coroutine_threadsafe(callback_coro(), loop)
+            
+            # Wait with timeout and handle errors
+            try:
+                return future.result(timeout=5)
+            except concurrent.futures.TimeoutError:
+                print("Progress callback timed out (non-critical)")
+                return False
+            except Exception as e:
+                print(f"Error in progress callback future: {str(e)}")
+                import traceback
+                print(traceback.format_exc())
+                return False
+        except Exception as e:
+            print(f"Error setting up progress callback: {str(e)}")
+            import traceback
+            print(traceback.format_exc())
+            return False
+
     def encode_query(self, query: str) -> np.ndarray:
         """
         Encode a single query into an embedding vector.
@@ -200,7 +239,9 @@ class EmbeddingEngine:
         
         # Initial progress update
         if progress_callback:
-            progress_callback(0, f"Starting index build for {len(passages)} passages")
+            should_cancel = self._run_progress_callback(0, f"Starting index build for {len(passages)} passages", progress_callback)
+            if should_cancel:
+                raise InterruptedError("Operation cancelled by user")
         
         # Create a batch tracking callback if we have a progress callback
         if progress_callback:
@@ -222,7 +263,7 @@ class EmbeddingEngine:
                     time_message = "Estimating time..."
                 
                 message = f"Processed {current_batch}/{total_batches} batches ({int(progress)}%). {time_message}"
-                should_cancel = progress_callback(progress, message)
+                should_cancel = self._run_progress_callback(progress, message, progress_callback)
                 return should_cancel
         else:
             batch_callback = None
@@ -237,7 +278,9 @@ class EmbeddingEngine:
             
             # Progress update before normalization
             if progress_callback:
-                progress_callback(90, "Normalizing embeddings and adding to index...")
+                should_cancel = self._run_progress_callback(90, "Normalizing embeddings and adding to index...", progress_callback)
+                if should_cancel:
+                    raise InterruptedError("Operation cancelled by user")
             
             # Normalize embeddings for cosine similarity
             faiss.normalize_L2(embeddings)
@@ -251,7 +294,9 @@ class EmbeddingEngine:
                 minutes = int(elapsed // 60)
                 seconds = int(elapsed % 60)
                 message = f"Index built with {self.index.ntotal} vectors in {minutes}m {seconds}s"
-                progress_callback(100, message)
+                should_cancel = self._run_progress_callback(100, message, progress_callback)
+                if should_cancel:
+                    raise InterruptedError("Operation cancelled by user")
             
             print(f"Index built with {self.index.ntotal} vectors in {time.time() - start_time:.2f}s")
         
@@ -263,7 +308,7 @@ class EmbeddingEngine:
             print(f"Error building index: {str(e)}")
             # Also update progress callback with error if available
             if progress_callback:
-                progress_callback(0, f"Error building index: {str(e)}")
+                self._run_progress_callback(0, f"Error building index: {str(e)}", progress_callback)
             raise
     
     def search(self, query: str, top_k: int = 10) -> List[Tuple[str, float]]:
@@ -341,7 +386,9 @@ class EmbeddingEngine:
         os.makedirs(save_dir, exist_ok=True)
         
         if progress_callback:
-            progress_callback(0, "Starting index save")
+            should_cancel = self._run_progress_callback(0, "Starting index save", progress_callback)
+            if should_cancel:
+                raise InterruptedError("Operation cancelled by user")
         
         # Save the index
         index_path = os.path.join(save_dir, 'faiss_index.bin')
@@ -350,13 +397,17 @@ class EmbeddingEngine:
         index_to_save = faiss.index_gpu_to_cpu(self.index) if hasattr(self.index, 'getDevice') else self.index
         
         if progress_callback:
-            progress_callback(30, "Saving FAISS index")
+            should_cancel = self._run_progress_callback(30, "Saving FAISS index", progress_callback)
+            if should_cancel:
+                raise InterruptedError("Operation cancelled by user")
         
         faiss.write_index(index_to_save, index_path)
         print(f"Index saved to {index_path}")
         
         if progress_callback:
-            progress_callback(70, "Saving passage IDs")
+            should_cancel = self._run_progress_callback(70, "Saving passage IDs", progress_callback)
+            if should_cancel:
+                raise InterruptedError("Operation cancelled by user")
         
         # Save passage IDs
         passage_ids_path = os.path.join(save_dir, 'passage_ids.pkl')
@@ -364,7 +415,9 @@ class EmbeddingEngine:
             pickle.dump(self.passage_ids, f)
         
         if progress_callback:
-            progress_callback(100, "Index save completed")
+            should_cancel = self._run_progress_callback(100, "Index save completed", progress_callback)
+            if should_cancel:
+                raise InterruptedError("Operation cancelled by user")
         
         print(f"Passage IDs saved to {passage_ids_path}")
     
@@ -381,7 +434,9 @@ class EmbeddingEngine:
             progress_callback: Optional callback(progress_percent, message) -> should_cancel
         """
         if progress_callback:
-            progress_callback(0, "Starting index load")
+            should_cancel = self._run_progress_callback(0, "Starting index load", progress_callback)
+            if should_cancel:
+                raise InterruptedError("Operation cancelled by user")
         
         # Load passage IDs
         passage_ids_path = os.path.join(load_dir, 'passage_ids.pkl')
@@ -389,7 +444,9 @@ class EmbeddingEngine:
             self.passage_ids = pickle.load(f)
         
         if progress_callback:
-            progress_callback(30, f"Loaded {len(self.passage_ids)} passage IDs")
+            should_cancel = self._run_progress_callback(30, f"Loaded {len(self.passage_ids)} passage IDs", progress_callback)
+            if should_cancel:
+                raise InterruptedError("Operation cancelled by user")
         
         print(f"Loaded {len(self.passage_ids)} passage IDs from {passage_ids_path}")
         
@@ -397,26 +454,34 @@ class EmbeddingEngine:
         index_path = os.path.join(load_dir, 'faiss_index.bin')
         
         if progress_callback:
-            progress_callback(40, "Loading FAISS index")
+            should_cancel = self._run_progress_callback(40, "Loading FAISS index", progress_callback)
+            if should_cancel:
+                raise InterruptedError("Operation cancelled by user")
         
         self.index = faiss.read_index(index_path)
         
         if progress_callback:
-            progress_callback(80, f"Loaded index with {self.index.ntotal} vectors")
+            should_cancel = self._run_progress_callback(80, f"Loaded index with {self.index.ntotal} vectors", progress_callback)
+            if should_cancel:
+                raise InterruptedError("Operation cancelled by user")
         
         print(f"Loaded index with {self.index.ntotal} vectors from {index_path}")
         
         # Move to GPU if requested and available
         if use_gpu_index and torch.cuda.is_available():
             if progress_callback:
-                progress_callback(90, "Moving index to GPU")
+                should_cancel = self._run_progress_callback(90, "Moving index to GPU", progress_callback)
+                if should_cancel:
+                    raise InterruptedError("Operation cancelled by user")
             
             print("Moving index to GPU")
             res = faiss.StandardGpuResources()
             self.index = faiss.index_cpu_to_gpu(res, 0, self.index)
         
         if progress_callback:
-            progress_callback(100, "Index load completed")
+            should_cancel = self._run_progress_callback(100, "Index load completed", progress_callback)
+            if should_cancel:
+                raise InterruptedError("Operation cancelled by user")
         
         self.index_initialized = True
 

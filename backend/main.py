@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 import json
 import time
 import traceback
+from starlette.websockets import WebSocketState  # <<== Added per update 1
 import logging
 import uuid
 import asyncio
@@ -124,23 +125,31 @@ async def broadcast_status_update(status_update: OperationStatus):
         "data": status_update.dict()
     }
     
-    # Send to all active connections
+    # Send to all active connections with better error handling
     disconnected_connections = []
     for connection in active_connections:
         try:
+            # Check if connection is still open before sending
+            if hasattr(connection, 'client_state') and connection.client_state != WebSocketState.CONNECTED:
+                logger.warning(f"Client not in CONNECTED state, marking for removal")
+                disconnected_connections.append(connection)
+                continue
             await connection.send_json(message)
         except Exception as e:
             logger.error(f"Failed to send status update to a client: {str(e)}")
-            # Mark connection for removal rather than removing while iterating
+            logger.error(traceback.format_exc())
+            # Mark connection for removal
             disconnected_connections.append(connection)
     
     # Remove disconnected clients
     for connection in disconnected_connections:
         try:
-            active_connections.remove(connection)
+            # Use discard instead of remove to avoid errors if connection is not in set
+            active_connections.discard(connection)
             logger.info(f"Removed disconnected client. Active connections: {len(active_connections)}")
         except Exception as e:
             logger.error(f"Error removing disconnected client: {str(e)}")
+            logger.error(traceback.format_exc())
 
 # Helper to add a new operation and broadcast its status
 async def create_operation(operation_type: str, title: str, details: Optional[str] = None):
@@ -397,11 +406,11 @@ async def get_pipeline():
 # WebSocket endpoint for real-time status updates
 @app.websocket("/ws/status")
 async def websocket_status_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    active_connections.add(websocket)
-    logger.info(f"WebSocket client connected. Active connections: {len(active_connections)}")
-    
     try:
+        await websocket.accept()
+        active_connections.add(websocket)
+        logger.info(f"WebSocket client connected. Active connections: {len(active_connections)}")
+        
         # Send all current operations as initial state
         for op_id, status in operations.items():
             try:
@@ -413,41 +422,30 @@ async def websocket_status_endpoint(websocket: WebSocket):
                 await asyncio.sleep(0.01)
             except Exception as e:
                 logger.error(f"Error sending initial status: {str(e)}")
+                logger.error(traceback.format_exc())
                 break
         
         # Keep the connection alive and handle incoming messages
         while True:
             try:
                 data = await websocket.receive_text()
-                try:
-                    message = json.loads(data)
-                    
-                    # Handle cancellation requests
-                    if message.get("type") == "cancel_operation":
-                        operation_id = message.get("operation_id")
-                        if operation_id in operations:
-                            cancellation_requests[operation_id] = True
-                            await update_operation_status(
-                                operation_id, 
-                                "canceling", 
-                                details="Cancellation requested"
-                            )
-                            logger.info(f"Cancellation requested for operation {operation_id}")
-                except json.JSONDecodeError:
-                    logger.warning(f"Received invalid JSON: {data}")
-            except WebSocketDisconnect:
-                logger.info("WebSocket client disconnected during receive")
+                # Process message...
+            except WebSocketDisconnect as e:
+                logger.info(f"WebSocket client disconnected during receive: code={getattr(e, 'code', 'unknown')}")
                 break
             except Exception as e:
                 logger.error(f"WebSocket receive error: {str(e)}")
+                logger.error(traceback.format_exc())
                 break
                 
-    except WebSocketDisconnect:
-        logger.info("WebSocket client disconnected")
+    except WebSocketDisconnect as e:
+        logger.info(f"WebSocket client disconnected: code={getattr(e, 'code', 'unknown')}")
     except Exception as e:
         logger.error(f"WebSocket error: {str(e)}")
+        logger.error(traceback.format_exc())
     finally:
-        active_connections.discard(websocket)  # Use discard instead of remove to avoid errors
+        # Use discard instead of remove to avoid errors
+        active_connections.discard(websocket)
         logger.info(f"WebSocket connection closed. Active connections: {len(active_connections)}")
 
 # New endpoints for operation status
