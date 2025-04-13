@@ -76,10 +76,16 @@ class EmbeddingEngine:
             return False
         
         try:
-            # Create a coroutine for the callback
+            # Create a coroutine that checks if the callback returns a coroutine
             async def callback_coro():
                 try:
-                    return await callback(progress, message)
+                    result = callback(progress, message)
+                    if asyncio.iscoroutine(result):
+                        # If it's a coroutine, await it
+                        return await result
+                    else:
+                        # If it's a direct value, return it
+                        return result
                 except Exception as e:
                     print(f"Error in progress callback coroutine: {str(e)}")
                     import traceback
@@ -94,7 +100,7 @@ class EmbeddingEngine:
             try:
                 return future.result(timeout=5)
             except concurrent.futures.TimeoutError:
-#                print("Progress callback timed out (non-critical)")
+                print("Progress callback timed out (non-critical)")
                 return False
             except Exception as e:
                 print(f"Error in progress callback future: {str(e)}")

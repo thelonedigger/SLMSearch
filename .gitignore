@@ -3,6 +3,7 @@
 /MSMARCO2
 /processed_data
 /processed_data_backup
+/backend/saved_pipeline
 *.env
 *.log
 __pycache__
