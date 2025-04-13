@@ -198,11 +198,19 @@ class EmbeddingEngine:
         # Process in batches to avoid memory issues
         total_batches = (len(passages) + batch_size - 1) // batch_size
         
+        # Initial progress update
+        if progress_callback:
+            progress_callback(0, f"Starting index build for {len(passages)} passages")
+        
         # Create a batch tracking callback if we have a progress callback
         if progress_callback:
             def batch_callback(current_batch, total_batches):
                 progress = (current_batch / total_batches) * 100
                 elapsed = time.time() - start_time
+                
+                # Ensure we log progress regularly
+                if current_batch % max(1, total_batches // 50) == 0 or current_batch == total_batches - 1:
+                    print(f"Indexing progress: {current_batch}/{total_batches} batches ({progress:.2f}%)")
                 
                 # Estimate remaining time
                 if current_batch > 0:
@@ -213,33 +221,50 @@ class EmbeddingEngine:
                 else:
                     time_message = "Estimating time..."
                 
-                message = f"Processed {current_batch}/{total_batches} batches. {time_message}"
-                return progress_callback(progress, message)
+                message = f"Processed {current_batch}/{total_batches} batches ({int(progress)}%). {time_message}"
+                should_cancel = progress_callback(progress, message)
+                return should_cancel
         else:
             batch_callback = None
         
-        # Generate embeddings with progress tracking
-        embeddings = self.encode_passages(
-            passages, 
-            batch_size=batch_size,
-            callback=batch_callback
-        )
+        try:
+            # Generate embeddings with progress tracking
+            embeddings = self.encode_passages(
+                passages, 
+                batch_size=batch_size,
+                callback=batch_callback
+            )
+            
+            # Progress update before normalization
+            if progress_callback:
+                progress_callback(90, "Normalizing embeddings and adding to index...")
+            
+            # Normalize embeddings for cosine similarity
+            faiss.normalize_L2(embeddings)
+            
+            # Add to index
+            self.index.add(embeddings)
+            
+            # Final progress update
+            if progress_callback:
+                elapsed = time.time() - start_time
+                minutes = int(elapsed // 60)
+                seconds = int(elapsed % 60)
+                message = f"Index built with {self.index.ntotal} vectors in {minutes}m {seconds}s"
+                progress_callback(100, message)
+            
+            print(f"Index built with {self.index.ntotal} vectors in {time.time() - start_time:.2f}s")
         
-        # Normalize embeddings for cosine similarity
-        faiss.normalize_L2(embeddings)
-        
-        # Add to index
-        self.index.add(embeddings)
-        
-        # Final progress update
-        if progress_callback:
-            elapsed = time.time() - start_time
-            minutes = int(elapsed // 60)
-            seconds = int(elapsed % 60)
-            message = f"Index built with {self.index.ntotal} vectors in {minutes}m {seconds}s"
-            progress_callback(100, message)
-        
-        print(f"Index built with {self.index.ntotal} vectors in {time.time() - start_time:.2f}s")
+        except InterruptedError as e:
+            print(f"Index building was interrupted: {str(e)}")
+            # Make sure to propagate the interruption
+            raise
+        except Exception as e:
+            print(f"Error building index: {str(e)}")
+            # Also update progress callback with error if available
+            if progress_callback:
+                progress_callback(0, f"Error building index: {str(e)}")
+            raise
     
     def search(self, query: str, top_k: int = 10) -> List[Tuple[str, float]]:
         """

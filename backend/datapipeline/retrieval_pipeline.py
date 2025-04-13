@@ -91,11 +91,23 @@ class RetrievalPipeline:
         
         # Get all passages
         passage_tuples = self.dataset.get_all_passages()
+        print(f"Retrieved {len(passage_tuples)} passages for indexing")
         passage_ids = [pid for pid, _ in passage_tuples]
         passage_texts = [text for _, text in passage_tuples]
         
+        # Initial status update
+        if self.status_callback:
+            asyncio.run_coroutine_threadsafe(
+                self._update_status("in-progress", 0, f"Starting index build for {len(passage_tuples)} passages"),
+                asyncio.get_event_loop()
+            )
+        
         # Create a progress callback for the embedding engine
         def progress_callback(progress: float, message: str) -> bool:
+            # Log progress to console
+            if progress % 5 == 0 or progress == 100:
+                print(f"Index build progress: {progress:.1f}% - {message}")
+                
             # Convert to async and run in thread pool
             if self.status_callback:
                 future = asyncio.run_coroutine_threadsafe(
@@ -105,9 +117,9 @@ class RetrievalPipeline:
                 # Wait for the callback to complete
                 try:
                     future.result(timeout=1)
-                except:
-                    pass  # Ignore timeouts or errors in status updates
-            
+                except Exception as e:
+                    print(f"Error in status callback: {str(e)}")
+                
             # Check for cancellation
             return self._check_cancelled()
         
